@@ -27,14 +27,18 @@
 
 	// Acumatica instance configuration. Edit these for your deployment
 	// (or leave the placeholders and override via the dashboard after deploy).
-	"vars": {
-		"ACUMATICA_URL": "http://10.0.20.120/AcumaticaQMS26R1/",
-		"ACUMATICA_TENANT": "Company",
-		"ACUMATICA_ENDPOINT_VERSION": "25.200.001",
-		"ACUMATICA_ENDPOINT_NAME": "Default",
-		"ACUMATICA_MAX_RECORDS": "1000",
-		"ACUMATICA_CANARY_GI": "MCPAccess"
-	},
+{
+  // ...
+  "vars": {
+    "ACUMATICA_CANARY_GI": "MCPAccess",
+    "ACUMATICA_ENDPOINT_NAME": "Default",
+    "ACUMATICA_ENDPOINT_VERSION": "25.200.001",
+    "ACUMATICA_MAX_RECORDS": "1000",
+    "ACUMATICA_TENANT": "Company",
+    "ACUMATICA_URL": "http://10.0.20.120/AcumaticaQMS26R1/"
+  },
+  // ...
+},
 
 	// KV namespaces. TOKEN_STORE holds per-user Acumatica tokens, OAuth
 	// state, the metadata cache, and runtime config overrides; OAUTH_KV is
