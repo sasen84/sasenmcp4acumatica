@@ -25,10 +25,9 @@
 		"global_fetch_strictly_public"
 	],
 
-	}
+	
 // Acumatica instance configuration. Edit these for your deployment
 	// (or leave the placeholders and override via the dashboard after deploy).
-{
   // ...
   "vars": {
     "ACUMATICA_CANARY_GI": "MCPAccess",
@@ -39,7 +38,6 @@
     "ACUMATICA_URL": "http://10.0.20.120/AcumaticaQMS26R1/"
   },
   // ...
-},
 
 	// KV namespaces. TOKEN_STORE holds per-user Acumatica tokens, OAuth
 	// state, the metadata cache, and runtime config overrides; OAUTH_KV is
