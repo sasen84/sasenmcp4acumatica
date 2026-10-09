@@ -135,9 +135,9 @@
 	"r2_buckets": [
 		// Long-term audit log storage via Logpush.
 		{
-			"binding": "mcp4acumatica_logs",
-			"bucket_name": "mcp4acumatica-logs",
-			"remote": true,"preview_bucket_name": "mcp4acumatica-logs"
+			"binding": "sasenmcp4acumatica_logs",
+			"bucket_name": "sasenmcp4acumatica-logs",
+			"remote": true,"preview_bucket_name": "sasenmcp4acumatica-logs"
 		},
 		// Schema-knowledge indexes (schema-index.json, etc.) read by the
 		// acumatica_search_schema / _get_schema_entity / _list_schema_entities
@@ -146,8 +146,8 @@
 		// Optional — those tools degrade gracefully when this is empty.
 		{
 			"binding": "INDEX_STORE",
-			"bucket_name": "mcp4acumatica-index",
-			"remote": true,"preview_bucket_name": "mcp4acumatica-index"
+			"bucket_name": "sasenmcp4acumatica-index",
+			"remote": true,"preview_bucket_name": "sasenmcp4acumatica-index"
 		}
 	]
 }
