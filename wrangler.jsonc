@@ -118,7 +118,7 @@
 
 	// Workers Logs — short-retention live tail in the Cloudflare dashboard.
 	"observability": {
-		"enabled": true
+		"enabled": false
 	},
 
 	// Allow importing .md and .sh files as text modules (docs site + /install.sh route).
