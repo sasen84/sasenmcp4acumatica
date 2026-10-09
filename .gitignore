@@ -1,0 +1,45 @@
+node_modules/
+.dev.vars
+.wrangler/
+dist/
+swagger.json
+
+# Schema-knowledge build artifacts. The ingestion scripts in scripts/ are
+# tracked (Apache-2.0); the indexes they generate are derived from
+# instance-specific / licensed Acumatica material and stay private — built
+# locally and uploaded to R2 out-of-band, never committed.
+.index/
+gi-xml/
+dac-source/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Local Claude Code settings
+.claude/
+
+# Local-only wrangler overrides. wrangler.jsonc is now tracked as the deploy
+# template (committed); after running setup.sh you can keep your real values
+# out of git with `git update-index --skip-worktree wrangler.jsonc`. The
+# .local-backup file is written by setup.sh / past versions of this repo
+# whenever an existing wrangler.jsonc is overwritten.
+wrangler.jsonc.local-backup
+
+# Drafted GI descriptions are instance data, not project source: they describe
+# one tenant's inquiries — their document-type filters, custom fields and
+# business rules — and this repo is public. Keep them out of git entirely.
+acumatica/gi-descriptions*.csv
+acumatica/gi-column-descriptions*.csv
+
+# Working state for the GI description effort: instance metadata pulls, the
+# design->OData column mapping, and drafted description text. All of it is
+# tenant data and this repo is public. Regenerable from Acumatica, but keep it
+# out of git either way.
+.gi-work/
+
+# Acumatica documentation corpora — licensed material, never commit. The
+# canonical copy lives in the private hallboys/acumatica-docs repo;
+# .docs-source/ is the local staging folder the docs-index ingestion reads.
+Markdown*/
+.docs-source/

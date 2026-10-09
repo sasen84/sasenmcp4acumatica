@@ -1,0 +1,28 @@
+{
+  "name": "sasenmcp4acumatica",
+  "version": "0.53.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types \"test/**/*.test.ts\"",
+    "build-schema-index": "node scripts/build-schema-index.mjs",
+    "upload-index": "node scripts/upload-indexes.mjs",
+    "build-index": "node scripts/build-schema-index.mjs && node scripts/upload-indexes.mjs",
+    "build-docs-index": "node scripts/build-docs-index.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.3.2",
+    "@cloudflare/workers-types": "^5.20260815.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "agents": "^0.21.0",
+    "hono": "^4.12.9",
+    "marked": "^18.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,637 @@
+# CLAUDE.md — Project Memory for MCP4Acumatica
+
+## Project Overview
+
+Remote MCP (Model Context Protocol) server on Cloudflare Workers that connects Claude to an Acumatica ERP 2025 R2 instance via the contract-based REST API. Each user authenticates directly with Acumatica — their Acumatica role controls what records they can access.
+
+- **License:** Apache 2.0 — Copyright 2026 Hall Boys, Inc.
+- **Copyright header** required on all `.ts` source files: `// Copyright 2026 Hall Boys, Inc.` + `// SPDX-License-Identifier: Apache-2.0`
+- **Git config (this repo only):** `user.email = saratvemuri@hallboys.com`
+- **Current tag:** `25R2-0.53.0`
+- **Deployed at:** `https://mcp4acumatica.hallboys.com` (primary custom domain) / `https://acumatica-mcp.hallboys.com` (legacy alias, kept active during migration) / `https://mcp4acumatica.<account>.workers.dev` (workers.dev fallback)
+- **GitHub:** `https://github.com/hallboys/MCP4Acumatica`
+
+## Architecture
+
+```
+Claude (claude.ai / Desktop / API)
+    │
+    ▼  MCP over streamable-http
+┌─────────────────────────────────┐
+│  Cloudflare Worker              │
+│  OAuthProvider wrapper          │
+│    ├─ /authorize → Acumatica    │
+│    ├─ /callback  ← Acumatica   │
+│    ├─ /token, /register (DCR+CIMD) │
+│    ├─ /docs → Documentation site │
+│    └─ /mcp → McpAgent DO        │
+│       ├─ 51 tools (38 read-only  │
+│       │   + 6 utility/discovery  │
+│       │   + 4 schema-knowledge   │
+│       │   + 2 documentation      │
+│       │   + 1 write)             │
+└──────────────┬──────────────────┘
+               │  Bearer token (per-user)
+               ▼
+        Acumatica 25R2 SaaS
+        Contract-Based REST API
+        Default/25.200.001
+```
+
+### Storage Abstraction (Platform Portability)
+
+Tool handlers, the Acumatica HTTP client, config, and caching are decoupled from Cloudflare via two abstractions:
+
+- **`IKeyValueStore`** (`src/lib/kv-store.ts`) — Platform-agnostic interface for key-value storage (get, put, delete, list). Cloudflare Workers uses `CloudflareKVStore` which wraps `KVNamespace`.
+- **`AppEnv`** (`src/types/acumatica.ts`) — Portable environment type containing Acumatica connection settings and a `store: IKeyValueStore`. All tool handlers and shared libraries use `AppEnv`. The Cloudflare-specific `Env` extends `AppEnv` with CF bindings (`TOKEN_STORE`, `OAUTH_KV`, `MCP_OBJECT`, etc.).
+
+This design allows future self-hosted adapters (Node.js + Redis/SQLite) to reuse all tool handlers without modification. See `docs/self-hosting-guide.md`.
+
+## OAuth Flow
+
+Claude → Worker `/authorize` → Acumatica login (with `openid profile email api offline_access` scopes) → Worker `/callback` → OIDC userinfo → canary GI access check → `/consent` interstitial → token stored → MCP session active.
+
+Acumatica is the sole identity provider. Users log in with their Acumatica credentials (or via whatever SSO their Acumatica instance is configured with). The MCP server does not manage identity separately — it delegates entirely to Acumatica.
+
+### Access Control & Governance
+
+1. **Access gate (canary GI):** After login, the callback queries the canary Generic Inquiry (default `MCPAccess`, configurable via `ACUMATICA_CANARY_GI`) via OData. The server **never checks role membership** — it only checks whether the user's token can *read* that GI: 200 → allowed, 403 → denied. Read access is restricted however the operator likes; assigning the GI only to a marker `MCP Access` role is the recommended way. This avoids exposing user/role data — the GI content is irrelevant, it's purely an access gate. Denied users see a 403 page directing them to contact their Acumatica admin. Implemented by `checkAccess()` in `acumatica-auth-handler.ts`; a 404/5xx is treated as misconfiguration (not denial) and logged as `login_denied` / `reason: access_check_misconfigured`.
+
+2. **Consent interstitial:** Users who pass the access check see a consent page explaining that data will be processed by AI, access is logged, and sensitive fields are redacted. They must acknowledge before the MCP session activates.
+
+3. **Sensitive field redaction:** Tool responses are automatically scanned for sensitive field names (SSN, bank accounts, salary, credit card, etc.) using pattern matching. Matched values are replaced with `[REDACTED]`. Patterns are configurable via `REDACT_PATTERNS` (add) and `REDACT_SKIP` (whitelist) env vars. See `src/lib/redact.ts`.
+
+4. **Enhanced audit logging:** All tool invocations include the Acumatica username, tool parameters (what was queried), duration, and success/error status. Auth events (login success, access denied, consent accepted) are logged separately in the Worker handler. Tool invocation and field redaction logs are written directly to R2 from the Durable Object (Cloudflare Logpush only captures Worker-level traces, not DO traces). The `writeLogsToR2()` function in `src/lib/logger.ts` writes NDJSON entries to `do-logs/{date}/{timestamp}-{random}.ndjson` keys in R2 and returns a boolean success flag. To minimize R2 file count, the DO buffers log entries (`logBuffer` in `AcumaticaMcpServer`) and flushes them when the buffer reaches 25 entries OR a scheduled flush fires 15 seconds after the last buffered entry. The buffer is mirrored to persistent DO storage (`ctx.storage` key `log_buffer`) on every append, because the scheduled flush runs on a **fresh DO instance** after eviction — in-memory state is gone by then. `flushLogs()` calls `hydrateBuffer()` first so the scheduled path reads the persisted entries from storage before writing to R2. Without this, short sessions (<25 entries) would be dropped whenever the DO was evicted between the tool call and the flush firing. Flushes are serialized via a `flushing` mutex so the threshold path and scheduled path cannot race over the buffer. If an R2 put fails, `flushLogs()` re-enqueues the snapshot at the head of the buffer, re-persists it, and schedules a retry flush (30 s); previously a failed put silently dropped the batch. **Flushes are scheduled via the Agent `schedule()` API** (`this.schedule(seconds, "flushLogsScheduled")`), NOT a raw `ctx.storage.setAlarm()` + `alarm()` override: since agents 0.21.0 the base `Agent` class owns the DO's single alarm slot — its scheduler re-arms the alarm and calls `deleteAlarm()` when it finds no schedule rows — so a raw `setAlarm` would be silently cancelled and an `alarm()` override would shadow the base dispatcher. The scheduler wakes the DO to run the callback even if it has gone idle. Console.log is preserved for `wrangler tail` live debugging. The admin console at `/docs/admin` reads both Logpush-written and DO-written logs from R2 using streaming server-side pagination (prefix-scoped R2 listing, parallel batched reads, incremental filtering, early-exit once one page of results is collected) to keep load times fast even for multi-day queries.
+
+5. **Pagination refusal semantics:** The list/query tools (`acumatica_list_entities`, `acumatica_run_inquiry`, `acumatica_list_generic_inquiries`) hard-cap results at `ACUMATICA_MAX_RECORDS` (default 1000, runtime-overridable via the admin console → KV `config:acumatica_max_records`). When a response hits the cap, the tool returns a structured envelope `{ results, truncated: true, mayBeComplete: true, paginationSupported: false, actionRequired: "..." }` instructing the model to stop calling and ask the user to refine `filterExpression`/`titleFilter`. The envelope explicitly states that the result *may* be complete — Acumatica's contract API and OData GI endpoints don't report a total count, so a response exactly at the cap is indistinguishable from a larger underlying result set. No server-side cooldown — the semantic response is the mechanism. The numeric cap is validated at write time by the admin console (positive integer, ≤ 10 000) via `validateConfigValue()` in `src/lib/config.ts`; downstream readers additionally use `parsePositiveIntConfig()` to defend against bad env-var values.
+
+6. **Rate limiting.** `withRateLimit()` (`src/lib/rate-limiter.ts`) enforces two caps keyed by Acumatica username: in-isolate concurrency and a per-minute KV-backed bucket (`ratelimit:{username}:{minute}`, TTL 120 s). Keying per-user prevents users on the same isolate from contaminating each other's limits; the KV bucket survives DO/isolate recycling so a client cannot bypass the per-minute cap by reconnecting. Active slots are tracked as `{id → startedAt}` rather than a bare counter; any slot older than 60 s is pruned as leaked, so an uncaught rejection or frozen isolate can't permanently eat a user's concurrency quota. The unit counted is an **HTTP call to Acumatica**, not a tool invocation — one tool call can make several.
+
+   **Configurable (0.41.0).** Both caps plus the queue wait are runtime settings (`config:rate_limit_max_concurrent` / `_max_per_minute` / `_queue_wait_ms`, env fallbacks `ACUMATICA_MAX_CONCURRENT` / `ACUMATICA_MAX_PER_MINUTE` / `ACUMATICA_RATE_LIMIT_QUEUE_WAIT_MS`, defaults 3 / 40 / 2000). `resolveRateLimits()` lives in `src/lib/config.ts` (not rate-limiter.ts — see the testability note below) and is called **once in the DO's `init()`**, stashing the resolved numbers on `AppEnv.rateLimits`; `withRateLimit()` takes them as a parameter and falls back to `DEFAULT_RATE_LIMITS` when absent (self-host adapters). Resolving per-session rather than per-call avoids three KV reads on every outbound request, at the cost of the usual "applies on the next DO instance" semantics. A zero or garbage cap falls back to the built-in default rather than being taken literally — otherwise one bad admin entry locks every user out.
+
+   **Bounded wait, not instant rejection.** A model firing several tool calls at once is the normal case, not abuse, and a typical Acumatica round-trip is well under a second — so a request that finds all slots busy waits up to `queueWaitMs` (polling every 50 ms) before being rejected. `queueWaitMs = 0` restores the pre-0.41.0 reject-immediately behavior. The check-then-set in `acquireSlot()` is deliberately synchronous (no `await` between reading `slots.size` and inserting) so waking waiters can't both claim the same free slot.
+
+   **Ordering guarantee:** the slot is acquired *before* the per-minute bucket is read, so a concurrency rejection never spends a per-minute token. A call that reaches Acumatica and then fails *does* spend its token — throttling retry storms is the point of the cap.
+
+   **Limit-reached behavior.** A bare "limit reached, retry shortly" string invites the model to retry instantly, reword the request, or switch tools. So `RateLimitError` carries structured fields (`limit`, `limitValue`, `retryAfterSeconds`, `waitedMs`) and `callTool` renders them via `rateLimitEnvelope()` as `{ error: "rate_limited", limit, limitValue, retryAfterSeconds, cause, actionRequired }` — same pattern as the pagination-refusal envelope. `cause` states explicitly that Acumatica was never contacted (so a throttle isn't reported to the user as an ERP outage); `actionRequired` says to retry the *same* request after the stated wait and not to reword/substitute/loop. `retryAfterSeconds` is exact for the per-minute cap (bucket keys are per calendar minute, so it's the time to the next boundary, ≤ 60 s). Each rejection also emits a `rate_limit_hit` log event (`logRateLimit()`), pushed to the R2 trail from `callTool` so throttling is filterable in the admin log viewer separately from real Acumatica failures — without it there'd be no data to tune the now-configurable caps against.
+
+   **Testability constraint:** `src/lib/rate-limiter.ts` must stay free of *runtime* imports (type-only is fine). `npm test` runs TypeScript in strip-only mode, which cannot resolve the extensionless specifiers used across `src/`. `tsconfig.json` sets `allowImportingTsExtensions` so a module under test can import a sibling with an explicit `.ts` specifier (config.ts → `./rate-limiter.ts` does this); that's the escape hatch for non-leaf modules. Strip-only mode also rejects **constructor parameter properties**, which is why `RateLimitError` declares its fields explicitly (`AcumaticaApiError` still uses parameter properties and is therefore not directly unit-testable).
+
+7. **Admin login throttling.** The admin console at `/docs/admin/login` is throttled per client IP via `admin_login_fail:{ip}` counters (KV, 15-minute window, 5 attempts). Further attempts 429 until the window expires; successful login clears the counter. All failures are padded to ≥ 1 s so the throttle path is indistinguishable from a slow mismatch. Client IP is sourced from `CF-Connecting-IP` with `X-Forwarded-For` fallback.
+
+8. **Per-user token serialization (TokenManager DO).** IdentityServer rotates the refresh token on every use, so concurrent refreshes of the same user's token race: the loser POSTs an already-rotated token, gets a `4xx`, and (as of 0.32.0) had its MCP grant spuriously revoked — a "session dead" on an otherwise-healthy account, the cause of *frequent* disconnects. The original in-isolate `inflightLookups` map only de-duplicated refreshes *within one isolate*; Claude.ai runs multiple concurrent sessions, each its **own** session DO/isolate, so the race persisted across them. Fixed (0.33.0) by routing all token access through a per-user **`TokenManager` Durable Object** (`src/token-manager.ts`, bound as `TOKEN_MANAGER`, keyed by `idFromName(acumaticaUsername)`). There is exactly one instance per user *globally*, so every token request across all of a user's sessions funnels through it and an in-DO inflight promise coalesces them into a single refresh — the cross-isolate race is now structurally impossible. The DO's own (strongly-consistent) storage is the authoritative token copy; KV (`user_token:{username}`) is a write-through backup and the adoption source for users who authed before the DO existed. `/callback` seeds the DO via `setToken()` so there's no KV eventual-consistency window right after re-auth. `getAcumaticaTokenForUser()` (`src/auth/acumatica-oauth.ts`) is now a thin shim over `env.tokenProvider.getAccessToken()`, mapping the DO's discriminated `TokenResult` (`ok`/`reauth`/`transient`) back to a token / `ReauthRequiredError` / plain `Error`. Platform portability is preserved via the `ITokenProvider` abstraction on `AppEnv` (`src/lib/token-provider.ts`; CF impl `DOTokenProvider` in `src/platform/do-token-provider.ts`; a self-hosted adapter wraps the same `refreshAcumaticaToken()` helper in a distributed lock). When a refresh fails, the shared `refreshAcumaticaToken()` helper classifies by **HTTP status, not the OAuth error string**: a `5xx`/`429` is the only genuinely transient case (IdentityServer up but momentarily unhappy — the same refresh token may succeed on retry) and throws a plain `Error`; any other failure (all `4xx` — `invalid_grant`, `invalid_request`, `invalid_client`, etc.) means the refresh token will never start working again, so `getAcumaticaTokenForUser()` throws a distinct `ReauthRequiredError`. (Keying off the exact `invalid_grant` string was the original 0.32.0 bug — Acumatica returns a `400` whose body doesn't reliably parse to that code, so dead tokens fell through to the transient branch and the model looped forever on "please try again shortly" instead of re-authenticating. Fixed in 0.32.1.) A `token_refresh_failed` diagnostic line (status + error *code* only — never the body, which can echo `client_secret`) is logged for `wrangler tail`. No stored token or no refresh token also throws `ReauthRequiredError`. The DO's `callTool` catch then revokes the user's MCP grant(s) via `getOAuthApi(oauthProviderOptions, this.env)` — `env.OAUTH_PROVIDER` is injected only on the Worker request path, not on the DO's env, so the helpers are reconstructed from the shared `oauthProviderOptions`. With the grant gone, the next `/mcp` request fails bearer validation (401 + `WWW-Authenticate: ... error="invalid_token"`) and the client silently re-runs OAuth instead of the user manually disconnecting/reconnecting. Transient failures (5xx/429, network) throw a plain `Error` and do **not** revoke, so a blip can't evict the user. The grant `userId` is the Acumatica username and all of a user's grants share the one per-user Acumatica token, so revoke-all is correct — each client re-auths independently on its next call. The current tool turn still returns the error text (the streamable-http transport has already committed a 200 for the in-flight request and a tool handler can't turn that into a 401 mid-stream); the re-auth kicks in on Claude's automatic retry.
+
+9. **Access-check misconfig vs. denial.** `checkAccess()` returns a discriminated result (`granted | denied | misconfigured`). 200 → granted, 403 → denied (user-facing access denied page), 404/5xx/network → misconfigured (separate "Configuration Error" page that points at the likely cause: missing GI, wrong tenant, OData not enabled). Misconfig events are logged as `login_denied` with `reason: access_check_misconfigured` so admins can see real outages rather than them being hidden behind "access denied" tickets.
+
+10. **Redaction regex concurrency.** `src/lib/redact.ts` no longer module-caches compiled regexes. The field-name regex is rebuilt per call (cheap; construction is cheaper than the walk), and the value-shape `SSN` / card regexes are per-call `new RegExp(...)` instances so the mutable `lastIndex` from the `g` flag can't race across concurrent redactions. The field regex drops the `g` flag entirely since it's only used with `.test(key)`.
+
+11. **`unwrapFields` drops `custom`.** Acumatica's `custom` container holds user-defined extension fields in a deeply nested type-tagged wire format (`{"Document": {"UsrField": {"type": "...", "value": ...}}}`). It's user data, but surfacing it as-is would bloat responses and confuse the model. See the comment in `src/lib/acumatica-client.ts` — for workflows that need custom fields, extend the per-entity `acumatica_get_*` tool with `$expand=custom` and a flatten step rather than changing `unwrapFields()` globally.
+
+12. **Registry-driven getters.** The 38 per-entity `acumatica_get_*` tools are defined as data in `src/tools/getter-registry.ts` (`GETTER_TOOLS`). Each entry describes an entity name, parameter list with defaults/optionality, and optional `$expand`. `src/index.ts` loops over the registry and registers each tool via a shared `runGetter()` handler. Adding a new single-record lookup is a ~7-line registry entry — no per-tool handler file, no per-tool `server.tool(...)` block. Utility/discovery tools that do more than a plain GET (pagination envelope, `$metadata` parse, cache invalidation) stay as dedicated handler files. **Endpoint-aware:** the getter entity names are curated for the stock `Default` endpoint; the base path honors `ACUMATICA_ENDPOINT_NAME` (see Config), and `runGetter()` re-messages a 404 on a non-`Default` endpoint via `endpointAware404Message()` (`src/tools/getter-errors.ts`) so "entity not exposed by this endpoint" reads distinctly from "wrong key." Registration is **not** conditional on a live entity catalog — the contract API requires a per-user token, so there's no auth-free way to enumerate the endpoint's entities at DO `init()`; the runtime 404 message is the seam instead.
+
+13. **Config diagnostics.** `src/lib/preflight.ts` exposes a `runPreflight()` probe that exercises every external touch-point: `ACUMATICA_URL` reachable, OIDC discovery, Connected App `client_credentials` grant (distinguishes `invalid_client` — bad creds — from `unsupported_grant_type` — creds valid, grant disabled), tenant OData path (`/t/{tenant}/...` → 401 = exists, 404 = wrong tenant), contract API endpoint version, and a **capability probe for the DAC-based OData endpoint** (`checkDacODataEndpoint`, 0.42.0 — see below). Surfaced two places: the admin console (`/docs/admin/preflight` → on-demand diagnostic table) and the `/callback` token-exchange path (known OAuth errors like `invalid_client` / `invalid_grant` are rendered as targeted pages via `interpretTokenError()` instead of a generic 502). Only the `error` field of IdentityServer error bodies is read — other fields can echo the submitted form, which includes `client_secret`.
+
+    **Authenticated preflight checks (0.43.0–0.45.0, DAC probe removed 0.47.0).** Acumatica SaaS authenticates *before* routing, so an unauthenticated request returns **401 for every path**, existent or not — verified live on 25R2: `/api/odata/nonsense/`, `/t/NotARealTenant/api/odata/gi/`, and `/entity/Default/99.999.999` all 401. `checkTenantPath` and `checkEndpointVersion` therefore **could not** detect a wrong value and reported a typo'd `ACUMATICA_TENANT`/`ACUMATICA_ENDPOINT_VERSION` as `pass` (fixed 0.45.0: both now `warn` on 401, `pass` only on a genuine 200). Real verification lives in `runAuthenticatedChecks()` — `POST /docs/admin/preflight/authed-checks` (CSRF + admin session) borrows a **user's** token via the `TokenManager` DO (`DOTokenProvider`), because preflight has no token of its own (no user by design; `client_credentials` disabled on the Connected App). With a token a 404 finally means "does not exist": `interpretTenantAuthed()` / `interpretEndpointAuthed()` (pure, unit-tested) return `fail` on 404, `pass` only on 200, and distinguish 403 ("tenant is real, user lacks rights") from 401 ("token expired, re-run"). Only status codes cross the boundary. Every run is logged as an `admin_action` (`logAdminAction()`) with the target username, because the call reaches Acumatica **as that user** and lands in Acumatica's own audit trail under their name.
+
+    **DAC-based OData: evaluated 2026-07-31, declined (probe removed in 0.47.0).** Acumatica 2025 R1+ exposes DACs directly over OData 4.0 at `/t/{tenant}/api/odata/dac`. Verified working on this instance (service root + `SOOrder` read → 200 with an ordinary user's token; per-DAC rights enforced — `Users`, `UsersInRoles`, `CustomerPaymentMethodDetail` → 403). Entity sets are addressed by **bare class name** (`SOOrder`, not `PX.Objects.SO.SOOrder`, which 404s — the qualified form is the OData *type*); up to three aliases per DAC; 4766 sets. **Declined** because none of the claimed advantages apply here: no speed case (production medians within 5% — 891 ms contract-REST vs 941 ms GI-OData; the 2–10x claim is about bulk reads, and these tools default to 100 rows, cap at 1000, and refuse pagination), no rate-limit case (**zero** Acumatica 429s in 95 days — the only binding limiter is our own, self-imposed and configurable), and the tempting win didn't materialize (`UsersInRoles` is 403, so the login gate still needs the canary GI rather than a direct role-membership query). Redaction turned out *not* to be the obstacle it looked like — physical DAC field names match contract-entity names for PII (`DateOfBirth`, `TaxRegistrationID`), so existing patterns fire unchanged. The one genuine gain, filters that work on complex document entities, is outweighed by a second vocabulary (physical DAC names), a new field-name index for discovery, and an allowlist to maintain. **What would flip this: a bulk workload** (export, reconciliation, nightly sync) — there OData is the right surface and this evaluation does not apply. Full record in `docs/odata-filtering.md`.
+
+14. **One-shot deploy.** `setup.sh` at the repo root wraps the full Cloudflare setup (KV namespace create, R2 bucket create, in-place substitution of values into `wrangler.jsonc`, `wrangler secret put` for each secret, `wrangler deploy`). Idempotent — detects an existing KV id in `wrangler.jsonc` and reuses it; skips R2 creation if the bucket already exists; before overwriting `wrangler.jsonc` it saves the previous file to `wrangler.jsonc.local-backup` (gitignored). The substitution targets `ACUMATICA_URL`, `ACUMATICA_TENANT`, `ACUMATICA_ENDPOINT_VERSION`, and the KV `id` field (matches the empty placeholder shipped in the tracked template AND any prior real id, so re-running with the same answers is a no-op). `COOKIE_ENCRYPTION_KEY` is always generated fresh; `ADMIN_SECRET` is auto-generated if the user leaves the prompt blank (and printed once). After deploy, the script extracts the `*.workers.dev` URL from the deploy output, logs in with the just-set `ADMIN_SECRET`, and calls `/docs/admin/preflight/api` so Acumatica-side misconfig is surfaced in the terminal before the user ever opens a browser. The Acumatica-side prerequisites (Connected App, `MCP Access` role, `MCPAccess` GI) can't be automated and are called out as follow-ups. After first run, prints a hint to run `git update-index --skip-worktree wrangler.jsonc` so future setup re-runs / pulls don't fight with local values.
+
+15. **One-line installer.** `install.sh` at the repo root is served by the worker at `/install.sh` (imported as a text module via the `**/*.sh` rule in `wrangler.jsonc`). Users run `curl -fsSL https://<worker>/install.sh | bash`; it checks for `git`/`node`/`npm`, clones the repo, `npm install`s, and `exec`s `./setup.sh < /dev/tty`. The `/dev/tty` redirect is load-bearing — when piped from curl, stdin is the pipe, so setup.sh's interactive prompts would otherwise immediately EOF. Served with `Content-Type: text/x-shellscript` and `Cache-Control: max-age=300`.
+
+16. **GUI install via Deploy-to-Cloudflare button.** The README links `https://deploy.workers.cloudflare.com/?url=https://github.com/hallboys/MCP4Acumatica`, which forks the repo to the user's GitHub, reads `wrangler.jsonc`, auto-creates the KV namespace and R2 bucket from the bindings declared with empty `id`/auto-creatable resources, prompts for secrets, and deploys. Vars (`ACUMATICA_URL`, `ACUMATICA_TENANT`, etc.) ship as placeholders that the user edits via the Cloudflare dashboard's `Variables and Secrets` UI after the first deploy — Cloudflare automatically redeploys when vars change. Custom-domain routes are commented out in the committed template; users add them via the Cloudflare dashboard or by editing `wrangler.jsonc` in their fork. This path is the only one that works with no terminal — every other step (Connected App, MCP Access role, MCPAccess GI, dashboard edits) is already a web UI.
+
+## Key Design Decisions
+
+1. **Acumatica as sole OAuth provider.** The MCP server redirects directly to Acumatica for login. No separate identity provider layer. See "Historical Note" below for why. The `/callback` route binds the OAuth `state` query parameter to an HttpOnly `acu_oauth_state` cookie set at `/authorize`; mismatch burns the KV state record (`acumatica_state:{state}`) as well as rejecting the request, so the record is single-use even on mismatch.
+
+2. **Per-user Acumatica tokens.** Each MCP user gets their own Acumatica OAuth token stored in KV keyed by `user_token:{acumaticaUsername}`. The user's Acumatica role governs record-level access. The MCP server additionally requires the `MCP Access` role (gate check) and applies sensitive field redaction before returning data to Claude. **Scope is load-bearing:** `/authorize` requests plain `api` (`acumatica-auth-handler.ts`), **not** `api:concurrent_access` — under `api` each access token is a single Acumatica session that auto-closes at token expiry (~1 h), so the stateless client (`doFetch` reuses no session cookie, never calls `/entity/auth/logout`) never leaks API-user license seats. Don't switch the scope without rewriting the client to manage cookies + logout. See `docs/architecture.md` → "Acumatica Session & License Model".
+
+3. **`@cloudflare/workers-oauth-provider`** wraps the entire worker. It acts as an OAuth 2.1 server for Claude, handling both CIMD (Client ID Metadata Documents, preferred) and DCR (Dynamic Client Registration, fallback) for client registration, plus token issuance, etc. The `defaultHandler` (Hono app) manages the Acumatica OAuth redirect flow. The `apiHandler` (McpAgent DO) handles `/mcp` requests with bearer token auth. CIMD requires the `global_fetch_strictly_public` compatibility flag in wrangler.jsonc for SSRF protection.
+
+4. **DO binding must be named `MCP_OBJECT`** — this is the default the `agents` SDK looks for in `McpAgent.serve()`. A second DO, `TOKEN_MANAGER` (class `TokenManager`), serializes per-user Acumatica token refresh (see Access Control #8); it's a plain `DurableObject` reached via RPC (`getAccessToken`/`setToken`), not an McpAgent.
+
+5. **Acumatica field values** are wrapped as `{value: X}`. The `unwrapFields()` utility recursively strips these before returning data to Claude.
+
+6. **`AppEnv` / `IKeyValueStore` abstraction.** Tool handlers and shared libraries (`config.ts`, `metadata-cache.ts`, `acumatica-oauth.ts`, `acumatica-client.ts`) use the platform-agnostic `AppEnv` type (which has `store: IKeyValueStore`) instead of the Cloudflare-specific `Env`. In `AcumaticaMcpServer.init()` we construct a fresh `this.appEnv: AppEnv` from `this.env` (never mutating the CF-provided binding object — that reference is shared across requests in the same isolate and hot-patching a `store` field onto it would leak state across sessions). `Env` no longer extends `AppEnv`; it only describes the CF bindings (plus Acumatica connection fields pulled from wrangler.jsonc). CF-specific code (auth handler, admin handler) uses raw `Env` / `KVNamespace` directly.
+
+7. **Tool annotations are a hard requirement for Microsoft 365 Copilot (0.53.0).** Copilot federated connectors silently withhold any tool lacking `readOnlyHint` — OAuth succeeds, sessions 200, no error, zero tool calls. Policy lives in one place (`src/tools/tool-annotations.ts`, `annotationsFor()`): default `readOnlyHint: true`; writers `readOnlyHint: false, destructiveHint: true, idempotentHint: false` (PUT-as-upsert overwrites when keyed and **auto-numbers a duplicate** when the key is omitted — so never mark a writer idempotent); `acumatica_clear_cache` `readOnlyHint: false, idempotentHint: true`; `openWorldHint: false` throughout. `init()` registers through the `this.tool(...)` wrapper (records each `RegisteredTool`), then `applyToolPolicy()` annotates everything and `disable()`s the writers when `writes_enabled` is off — hidden from `tools/list`, still registered (a future per-user write gate can `enable()` per session), and `runWriter` still enforces the kill switch per call. **A tool registered via `this.server.tool(...)` directly bypasses the policy and ships unannotated** — Copilot would withhold it with no error. With writes off, clients see 50 tools, not 51.
+
+## Historical Note: Why We Removed Microsoft Entra ID
+
+The initial design used a two-login chained OAuth flow: users first authenticated via Microsoft Entra ID (to identify who they are), then were chained to Acumatica OAuth (to get API permissions). This required a separate Entra app registration, three callback routes, and intermediate state management in KV.
+
+We removed Entra ID entirely because:
+- **It was redundant.** Since every user must authenticate with Acumatica anyway (to get a per-user API token with their role-based permissions), the Entra login added no value — Acumatica already knows who the user is.
+- **Acumatica can use Entra SSO natively.** If an Acumatica instance is configured with Entra SSO, users still get the Microsoft login experience — it just happens through Acumatica's own login page, not through our MCP server.
+- **Simpler flow.** One login instead of two. One callback route instead of three. No Entra secrets to manage.
+
+Old Entra-related secrets (`ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET`, `ENTRA_TENANT_ID`) may still exist on the Cloudflare side and should be cleaned up with `wrangler secret delete`.
+
+## File Structure
+
+```
+src/
+├── index.ts                       # Entry point — OAuthProvider + AcumaticaMcpServer (McpAgent DO); re-exports TokenManager
+├── token-manager.ts               # TokenManager DO — per-user token-refresh serializer (TOKEN_MANAGER binding)
+├── auth/
+│   ├── acumatica-auth-handler.ts  # Acumatica OAuth flow (/authorize, /callback, /consent, access gate, OIDC discovery)
+│   └── acumatica-oauth.ts         # Token getter shim (→ AppEnv.tokenProvider) + shared refreshAcumaticaToken() helper
+├── admin/
+│   └── admin-handler.ts           # Admin console: auth, settings, log viewer (Hono sub-app)
+├── docs/
+│   ├── docs-handler.ts            # Hono sub-app: renders markdown docs to HTML, mounts admin
+│   └── markdown.d.ts              # TypeScript declaration for .md text module imports
+├── lib/
+│   ├── acumatica-client.ts        # HTTP client for Acumatica REST API (GET + PUT-as-upsert); re-exports field-transforms
+│   ├── field-transforms.ts        # wrapFields/unwrapFields — {value:X} wire-format round-trip (import-free leaf, unit-tested)
+│   ├── response-parse.ts          # parseAcumaticaJson — empty/non-JSON 2xx bodies → actionable errors (import-free leaf, unit-tested)
+│   ├── odata-filter.ts            # normalizeODataFilter() — strips `eq true` off substringof/startswith/endswith (v3-motivated)
+│   ├── odata-v4-errors.ts         # GI (v4) filter-error → correction envelope (import-free leaf, unit-tested)
+│   ├── gi-registry.ts             # GI opt-in gate + curated-schema assembly (pure leaf: checkGiGate, parseEdmxTypes, assembleRegistry)
+│   ├── gi-registry-build.ts       # getGiRegistry() — lazy registry build (caller's token) + KV cache (impure)
+│   ├── gi-rows.ts                 # cleanGiRow/cleanGiRows — strip @odata + trim space-padded fixed-width values
+│   ├── complex-entities.ts        # known complex document entities + getFilterErrorKind() (filter-binder 500 classifier)
+│   ├── config.ts                  # KV-backed runtime config (uses IKeyValueStore)
+│   ├── kv-store.ts                # IKeyValueStore interface (platform-agnostic storage)
+│   ├── token-provider.ts          # ITokenProvider interface + TokenResult (platform-agnostic token serialization)
+│   ├── metadata-cache.ts           # KV-backed cache (uses IKeyValueStore)
+│   ├── blob-store.ts              # IBlobStore interface (platform-agnostic read of large index blobs)
+│   ├── index-store.ts             # loadIndex()/indexExists() — per-isolate-cached read of schema-knowledge indexes
+│   ├── schema-search.ts           # ISchemaSearch + KeywordSchemaSearch (seam for future Vectorize impl)
+│   ├── docs-search.ts             # docs-catalog search + chunk resolution (import-free leaf, unit-tested)
+│   ├── rate-limiter.ts            # per-user concurrency + per-minute limits (configurable; runtime-import-free)
+│   ├── logger.ts                  # Structured JSON audit logging (tool, auth, redaction events)
+│   ├── preflight.ts               # Config diagnostics — admin page + /callback error mapping
+│   └── redact.ts                  # Pattern-based sensitive field redaction
+├── platform/
+│   ├── cloudflare-kv-store.ts     # CloudflareKVStore — wraps KVNamespace as IKeyValueStore
+│   ├── cloudflare-r2-blob-store.ts # CloudflareR2BlobStore — IBlobStore backed by an R2 bucket
+│   └── do-token-provider.ts       # DOTokenProvider — ITokenProvider backed by the TokenManager DO
+├── tools/                         # Registry-driven getters + utility + schema-knowledge handlers
+│   ├── getter-registry.ts         # 38 per-entity `acumatica_get_*` tools as data (GETTER_TOOLS) + runGetter
+│   ├── getter-errors.ts           # endpointAware404Message() — endpoint-aware 404 re-messaging (import-free leaf, unit-tested)
+│   ├── writer-registry.ts         # write tools as data (WRITER_TOOLS) + runWriter (kill-switch, dry-run gate, allowlist, PUT, audit sink)
+│   ├── tool-annotations.ts        # annotationsFor()/titleFromName()/writesEnabled() — central MCP annotation policy (import-free leaf, unit-tested)
+│   ├── writer-validation.ts       # validateWriterPayload() — size/JSON/type + top-level & nested allowlist (import-free leaf, unit-tested)
+│   ├── entity-list.ts             # acumatica_list_entities (Utility)
+│   ├── entity-schema.ts           # acumatica_describe_entity (Utility)
+│   ├── generic-inquiries.ts       # acumatica_run_inquiry (Utility)
+│   ├── generic-inquiry-discovery.ts # acumatica_list_generic_inquiries, _describe_inquiry (Utility)
+│   ├── clear-cache.ts             # acumatica_clear_cache (Utility)
+│   ├── clear-cache-match.ts       # matchesClearTarget() — bulk-clear key matching (import-free leaf, unit-tested)
+│   ├── schema-discovery.ts        # acumatica_search_schema, _get_schema_entity, _list_schema_entities (offline schema index)
+│   ├── docs-tools.ts              # acumatica_search_docs, _get_doc_section (offline docs index; bounded part cache)
+│   └── gi-explain.ts              # acumatica_explain_gi_xml (stateless GI XML structural summary)
+└── types/
+    └── acumatica.ts               # All TypeScript types, AppEnv, Env, AuthProps
+
+scripts/                           # OSS ingestion scripts (Apache-2.0); generated indexes stay private (.index/, gitignored)
+├── build-schema-index.mjs         # swagger.json → .index/schema-index.json
+├── build-docs-index.mjs           # official Markdown docs set → .index/docs-index.json + docs-chunks/* parts
+└── upload-indexes.mjs             # uploads present .index/* to the mcp4acumatica-index R2 bucket (chunk parts before the docs catalog)
+
+test/                              # Node built-in test runner (node --test, TS type-stripping) — `npm test`
+├── odata-filter.test.ts           # normalizeODataFilter regression (substringof eq true)
+├── complex-entities.test.ts       # getFilterErrorKind / known-list / keyed-filter detection
+├── getter-errors.test.ts          # endpointAware404Message (Default vs custom endpoint 404)
+├── gi-registry.test.ts            # checkGiGate semantics + cleanGiRow + parseEdmxTypes/assembleRegistry
+├── field-transforms.test.ts       # wrapFields/unwrapFields round-trips (nested/array/idempotent/null)
+├── tool-annotations.test.ts       # annotation policy (read-only default, writer destructive/non-idempotent, clear_cache, titles)
+├── writer-validation.test.ts      # validateWriterPayload (size cap / JSON / type / top-level + nested allowlist)
+├── rate-limiter.test.ts           # config precedence, bounded slot wait, per-minute bucket, token-accounting order, envelope
+├── preflight-authed.test.ts       # interpretTenantAuthed/EndpointAuthed (a 404 never becomes a pass)
+├── response-parse.test.ts         # parseAcumaticaJson (empty body ≠ no records; write path forbids retry; non-JSON snippet)
+├── clear-cache-match.test.ts      # matchesClearTarget (target=gi sweeps gi_schema:*; typo targets match nothing)
+├── docs-search.test.ts            # docs search scoring, Form ID normalization, part-boundary resolution
+├── docs-ingest.test.ts            # build-docs-index.mjs cleanup/chunking/Form-ID scoping (synthetic fixture)
+└── odata-v4-errors.test.ts        # GI v4 filter corrections (substringof→contains, captions, ISO dates)
+
+acumatica/                         # Acumatica-side setup package (Apache-2.0) for the GI exposure gate
+├── MCP4Acumatica-AIDescription.zip # customization project: GIDesign/GIResult custom fields + SM208000 form
+├── MCPGIs.xml, MCPGIFields.xml     # feed GIs the registry reads; MCPAccess.xml — role-gate canary GI
+└── README.md                       # import order + feed-column → gi-registry.ts mapping
+```
+
+## Schema Knowledge Tools (0.34.0)
+
+Four tools help power users build *against* Acumatica (discover entities/fields/relationships, read GI structure) rather than query business data. Architecture, shared with planned DAC + GI-XML workstreams: an **OSS ingestion script** (`scripts/`) the operator runs against a source they're licensed to access → a compact **private JSON index** in R2 (gitignored `.index/`, uploaded out-of-band) → **OSS tools** querying it. This keeps the build pipeline open-source while the derived index (instance-specific / licensed material) stays private.
+
+- **Source.** `acumatica_search_schema` / `_get_schema_entity` / `_list_schema_entities` read `schema-index.json`, built from the instance's own `swagger.json` (contract API description, incl. customizations — no third-party IP). They answer offline (no tenant round-trip), complementing the *live* `acumatica_describe_entity` (`$adHocSchema`). `acumatica_explain_gi_xml` is **stateless** — it summarizes a pasted GI definition XML and needs no index, so it always registers.
+- **Storage abstraction.** `IBlobStore` (`src/lib/blob-store.ts`; CF impl `CloudflareR2BlobStore`) on `AppEnv.indexStore`, backed by the `INDEX_STORE` R2 bucket (`mcp4acumatica-index`). `loadIndex()` (`src/lib/index-store.ts`) memoizes the parsed index per isolate; `indexExists()` is a cheap `R2.head` used at `init()` for **conditional registration** — the three index-backed tools register only when the index is present, so a deploy without a built index never advertises tools that would error.
+- **Search.** Keyword + structured today, behind `ISchemaSearch` (`src/lib/schema-search.ts`) so a `VectorSchemaSearch` (Vectorize + Workers AI) can be added later without touching handlers.
+- **Scope evolution — documentation lookups were scoped out, then scoped back IN (0.51.0).** The original rationale — "the public Help Wiki (`help.acumatica.com`) is reachable via the AI client's own web search, so we don't vectorize/redistribute it" — proved false in practice: the Help Wiki intermittently bot-blocks browsers and AI fetch ("refused for this browser"; Acumatica support couldn't fix it, verified through 2026-08). The docs tools (see "Documentation Knowledge Tools" below) now serve the official docs from a private per-operator index. **DAC-layer metadata remains intentionally NOT a tool**: stock DACs are covered by Acumatica's DAC Schema Browser, and the only gap — *custom* DACs/extensions — is best answered from the customization source the developer already has (API-exposed custom fields are already covered by the schema tools). A DAC-via-GI customization was prototyped and dropped (see `git log`) once this redundancy was clear. Note the DAC browser lives on the same unreliable host — if that bites, the same docs-index pattern applies. A GI XML *example* library remains a possible future workstream.
+
+## Documentation Knowledge Tools (0.51.0)
+
+`acumatica_search_docs` + `acumatica_get_doc_section` answer "how do I / what does this screen or field do / what changed" questions from the **official Acumatica documentation** — same OSS-script → private-R2-index → conditionally-registered-tools architecture as the schema tools. Exists because `help.acumatica.com` bot-blocks unreliably (see "Scope evolution" above); the operator supplies the official Markdown documentation set, from either Acumatica's **public GitHub repo** (`github.com/Acumatica/Acumatica-AI-Resources`, `Documentation/`, one **branch per release** — DITA-converted, so no PDF-artifact cleanup needed and Form IDs are recoverable from filenames; 2026 R1 and later only) or the **Beacon Portal** (`https://beacon.acumatica.com/`, customer-portal login required — PDF-converted; the only source for pre-2026 R1 releases). **Either way it is licensed content — never committed, never redistributed:** the GitHub repo's `Documentation/` is explicitly excluded from that repo's GPLv3 and is all-rights-reserved, so public readability is not redistribution rights. (The rest of that repo is GPL-3.0-only — do not copy its skill text into this Apache-2.0 project.) Hall Boys' copy lives in the private `hallboys/acumatica-docs` repo, one folder per release.
+
+- **Ingestion:** `scripts/build-docs-index.mjs` (exports pure functions, unit-tested via `test/docs-ingest.test.ts`; `main` runs only when executed directly). Cleans PDF-conversion artifacts (PAGE_BREAK markers, running headers, dot-leader TOC lines, title-page noise headings), chunks by heading with full breadcrumbs, splits >7 KB sections at paragraph boundaries, drops <80-char stubs, and tags Form Reference chunks with their Form ID (a `Form ID: (XX000000)` definition tags its whole H2 scope; body *mentions* of other forms deliberately don't).
+- **Memory design (the load-bearing decision):** the corpus is ~40 MB and must never be held in worker memory. The catalog (`docs-index.json`, ~3.5 MB) holds ONLY heading breadcrumbs + Form IDs — no body text — and is the one thing `loadIndex()` memoizes; section text lives in ~700 KB `docs-chunks/{slug}-{n}.json` R2 parts fetched on demand through a 4-entry FIFO cache in `docs-tools.ts` (deliberately NOT via `loadIndex()`, whose memo never evicts). Consequence: **search matches section headings + Form IDs, not body text** — the tool descriptions steer the model to feature terminology, and `ISchemaSearch`-style seam thinking applies (a Vectorize semantic search can replace `searchDocs()` without touching handlers).
+- **Form ID as a first-class key:** `acumatica_get_doc_section` accepts a bare Form ID (`AP301000`) and returns the screen's reference sections (purpose → toolbar commands → tabs/fields) in document order with a truncation envelope + `remainingSections` list; chunkId mode returns `prev`/`next` neighbors for browsing. 916 forms tagged in the 2025R2 build.
+- **Redaction bypass:** both tools pass `skipRedaction` to `callTool` — the payload is vendor documentation, and the payroll/1099/AP guides legitimately *discuss* fields named SSN etc.; pattern redaction would mangle the prose. Only valid for tools that cannot return tenant records.
+- **Upload ordering:** `upload-indexes.mjs` puts `docs-chunks/*` parts BEFORE `docs-index.json` — a live worker resolving a new catalog against old parts would misalign section text.
+- **Upgrades:** the index describes one release; rebuild from the new release's markdown set (upgrading guide §3b). 2025R2-build quirk: guide title pages read "2025 R1" (release notes genuinely R2) — title-page headings are stripped by ingestion, so this affects provenance only.
+
+## GI Tool Gating & Registry (0.37.0)
+
+Opt-in gate + curated enrichment for Generic-Inquiry tools, layered on the existing three GI tools (`acumatica_run_inquiry`, `acumatica_list_generic_inquiries`, `acumatica_describe_inquiry`) — **not** per-GI dynamic tools (that's a deferred, separate workstream; see `docs/gi-discovery-plan.md`). The REST/entity getters are unaffected.
+
+**Why it exists (not optional — a data-correctness control):** a mature instance has hundreds of GIs, most built for human screens; surfacing them all floods the model's context (`list_generic_inquiries` is the model's menu) and degrades GI selection, and many return UI-shaped output unfit for an agent. **Most importantly:** a **parameterized GI exposed via OData returns silently wrong data** — queried without its parameters (which is how the agent queries), Acumatica returns default/unfiltered rows with no error, which the model can't detect. So the gate is a safeguard against feeding the model incorrect data, not a nicety. Parameterized GIs are kept out of the registry (discovery excludes them, the `MCPGIs` feed filters parameter-free), and `run_inquiry` / `describe_inquiry` **refuse any parameterized GI outright** (a `{Name}_WithParameters` `$metadata` check, `parameterizedGiNames`) regardless of gate state — so even uncurated, the model can't get silently-wrong data from one. The gate makes exposure opt-in so only GIs a human tagged `ExposedToMCP` (and vetted parameter-free) reach the model. **Operator/user-facing rationale + selection guidance + setup live in `docs/generic-inquiries.md`** (served at `/docs/generic-inquiries`); this section is the implementation-facing companion.
+
+- **Lazy pull, no service account, no Cron.** The registry is built **on demand with the requesting user's token** (`getGiRegistry()`, `src/lib/gi-registry-build.ts`) when the KV cache (`cache:gi_registry`) is stale, then cached for everyone. The gate list + field schemas are *global* data (identical for all users) and contain only GI/field **metadata, never business rows**, so building from whichever user's token is in hand is safe; execution still uses each user's own token with their row-level access. This was chosen over a scheduled/service-account builder after verifying `client_credentials` is disabled on the Connected App (`unauthorized_client`) — and it matches the spec's TTL pull model.
+- **Feeds.** Two GIs supply the registry (bundled in `acumatica/` as importable GI exports): `MCPGIs` (one row per exposed GI — output columns `Name`, `AIDescription`, `ScreenID`, `ScreenDescription`, `DesignID`; row-filtered to `UsrExposedToMCP = true AND ExposeViaOData = true` and parameter-free via `GIFilter.LineNbr IS NULL`) and `MCPGIFields` (per output column — `Name`, `DesignID`, `ObjectName`, `Field`, `FieldName`, `SchemaField`, `Caption`, `LineNbr`, `SortOrder`, `IsActive`, `AIDescription`; row-filtered to `UsrExposedToMCP = true AND ExposeViaOData = true`). **OData property name = the result-column caption**, so these captions are the literal keys `gi-registry.ts` reads (`FeedGiRow`/`FeedFieldRow`): `Name`→`giName`, `ScreenID`→`entryScreen` — renaming a caption requires the matching change in `gi-registry.ts`. Field **types** come from OData `$metadata` (Path A — verified the wire is not string-flattened, so declared numeric types are trustworthy; sample inference mislabels whole-number decimals as `integer`). `parseEdmxTypes`/`assembleRegistry` (`src/lib/gi-registry.ts`, a pure unit-tested leaf) resolve authoritative property names (incl. `_N` collision suffixes), attach curated captions/descriptions **positionally** (see below), and **fall back to runtime inference** for any GI/field without a declared type or description. Exposure is *never* gated on description presence. Both feeds are **paged** during the build (`fetchFeed`, `FEED_MAX_PAGES = 10`) — the field feed runs to thousands of rows on a mature instance and a silently truncated tail costs every later GI its column descriptions; this is an internal metadata pull, not a model-facing response, so the anti-pagination policy doesn't apply.
+- **Column descriptions are attached POSITIONALLY, not by name (0.48.0).** A column's OData property name **cannot be predicted from the design**: `GIResult.Caption` is only an *override* (verified live 2026-08-15 — 1 079 of 1 907 result columns across 115 curated GIs have a NULL caption; 16 GIs have none at all), and `GIResult.SchemaField` is NULL for most rows and **DAC-qualified** where present (`INTran.RefNbr`), so it never equals the bare property (`RefNbr`). The original caption→`Usr`-strip→field-name matcher therefore dropped the majority of curated column descriptions — `describe_inquiry` returned bare `{fieldName, dataType}` even where descriptions existed in Acumatica. `resolveFields` now reproduces Acumatica's actual projection: `properties = [result columns that are also entity keys, hoisted to the FRONT in key order] ++ [remaining ACTIVE design rows in SortOrder order] ++ [keys that are not result columns, appended at the END with no design row]`. Specifics that are easy to get wrong: the order is **`SortOrder`, not `LineNbr`** (they diverge — in `PM-Projects`, `Builder` is LineNbr 4 but grid position 2); **`IsActive` must be honoured** (inactive rows never reach OData, so counting one shifts every later column); key hoisting is the **normal** case (108 of 115 GIs). Alignment is a DP over the active rows in which a **captioned row is a hard constraint** — it must land on the property its caption names — plus a greedy assignment of the hoisted keys. If the active-row count exceeds the property count, or one captioned row cannot be satisfied, the GI's annotation is **rejected wholesale** (names + declared types still returned, no captions/descriptions): a mis-shifted description is worse than none.
+
+- **Alignment diagnostics + `/docs/admin/gi-alignment` (0.52.0) — the refusal was previously invisible.** `resolveFields` refuses a GI's annotations *wholesale*, so an operator saw bare field names with no indication why, while the descriptions sat correctly in Acumatica. It now reports its own verdict through an optional sink into `GiRegistry.alignment` (`GiAlignmentDiagnostic[]`: status + activeRows/properties/captioned/described/hoisted per GI). Statuses distinguish causes needing *different* fixes: `alignmentAmbiguous` (caption the ambiguous columns), `feedMissingActiveFlag` / `feedRowsExceedProperties` (re-import `MCPGIFields.xml`, clear the GI cache), `noMetadata`, `noFieldRows`. Surfaced at `/docs/admin/gi-alignment`, which reads **only the cached registry from KV** — no Acumatica request, no borrowed user token, nothing in Acumatica's audit trail (unlike the authenticated preflight checks). The diagnostic lives on `GiRegistry`, never on `GiRegistryEntry`, so nothing model-facing changed. Raw data: `npx wrangler kv key get "cache:gi_registry" --namespace-id <id> --remote`.
+- **Measured 2026-09-02 (production): 118 of 121 gated GIs aligned, 3 refuse, and the refusals hide ZERO curated descriptions.** Every GI that *has* column descriptions aligns; the historical "13 refuse" figure below predated the 0.49.1 DP fix and had never been re-measured. **Caption density does not predict refusal** — `IN-StockItem` aligns at 7 % captioned and `GL-Journal Transactions` at 0 %, because the declared-type constraint resolves them — so triage from the admin page, not from caption counts.
+- **`expectedTypeFamily` tested the boolean prefix against the LOWERCASED field name — fixed 0.52.0.** `/^(is|has)[a-z]/` matched anything merely starting with those letters, so `issueDate` ("is" + "sueDate") was classified boolean, contradicted its own `Edm.DateTimeOffset` property, scored as an impossible pairing, and refused the **whole GI** — with the conflict on an *uncaptioned* row, so no caption edit could ever have fixed it (found on `FS-Licenses` after the operator captioned every hoisted key exactly as prescribed). Now `/^(is|has)[A-Z]/` against the original camelCase; an all-lowercase field yields no constraint rather than a wrong one. **Triage lesson: before telling an operator to caption a GI, confirm the refusal is not a type-heuristic false positive — the admin page's counts cannot tell the two apart.**
+- **Caption-pinning is a DECLARATION, not a guess — that is why it works.** Acumatica derives the property name from the column's display name, so captioning a row *causes* its property name; for a captioned row the alignment is correct by construction rather than inferred. Verified live on `HPL-PHYINVDATADB` and `HPL-AcuStockIssues` (both flipped to `aligned`; values confirm the pairings — `ReferenceNbr`=`PHY0004`, `Warehouse`=`GARES`). Two cautions: a **typo in a caption becomes the property name** (`DcoumentType_2`, `LastMoidified` are live examples — fix before any description references them, since correcting a caption renames the property and breaks consumers), and collision suffixes must be captioned **literally** (`ReferenceNbr_2`).
+- **DEAD END — do not derive the hoist count by sweeping candidate values.** Tried it: on one GI the *declared* `hoist=2` refuses while both `H=0` and `H=1` align, so a sweep yields multiple candidates and must refuse anyway (or silently pick one). Relatedly, Acumatica sometimes hoists columns that are **not declared keys** — one production GI's property order implies a clean 3-column hoist while `$metadata` declares `hoist=0`, a shape the hoist-prefix model cannot express, so captioning cannot fix that GI either.
+
+**Two more rejection rules, added 0.48.2 — captions alone are not enough.** Most columns have no caption, so on a lightly-captioned GI every candidate scored 0, the DP tied, and the tie fell to iteration order. Found on production `SO-Invoice` via `acumatica_describe_inquiry`: six columns each carried the *previous* column's description because the `curyDocBal` row had been hoisted onto the string key `Customer`. **An ERP-side read-back cannot detect this** — the stored `UsrResAIDescription` values were correct; only the delivery mapping was wrong. So (a) `columnScore()` rejects a pairing whose declared `$metadata` type contradicts the family implied by the design row's field name (`expectedTypeFamily()`/`typeConflicts()` — conservative by design: calculated `=…` columns yield no constraint, and `integer` is compatible with everything since Acumatica surfaces identifiers as int or string per DAC); and (b) a surviving tie **refuses**. Ambiguity means the globally optimal row→property assignment is not unique (0.49.1: bitmask-DP assignment with optimum-count tracking — the earlier greedy matcher's *local* tie test falsely refused constraint-forced choices, e.g. a row captioned `DocumentType` tying on `DocumentType`/`DocumentType_2` while the sibling captioned `DocumentType_2` forces it onto the bare name). **Do not rank an exact caption match above a suffix-stripped one** — collision `_N` suffixes are positional (the earlier grid row takes the bare name), so a captioned row after an uncaptioned same-name row correctly owns `X_2`; verified counterexample on a production forecast GI, see `columnScore()`. A weak shared-token signal, ranked below the substring tiers, separates candidates the earlier tiers rank identically (`finPeriodID`→`PostPeriod` shares "period"). Measured on the production feed: 95 of 112 gated GIs unchanged, 4 mappings **corrected**, 13 now refuse. **An operator can make a refusing GI determinate with no code change:** set `GIResult.Caption` on its hoisted key columns to exactly the property name OData already reports — a no-op rename that pins the alignment permanently. `skills/acumatica-gi-descriptions/scripts/align_columns.mjs` carries the same rules (declared-type constraint, DP tie counting, hoist-assignment ambiguity refusal — ported 0.49.0 and verified to reproduce the hand-checked hoists on AP-Bills {1,2,6,33} and SO-Invoice {1,2,6,22}); keep the two matched when either changes. `predictPropertyName` survives only for the degraded no-`$metadata` path.
+- **Gate semantics (`checkGiGate`) — NOT fail-open.** No registry yet (never built — feed GIs not readable, or cold bootstrap) → gate **inactive**: `list` returns **no GIs** (discovery suppressed — the model isn't handed an uncurated menu); `run`/`describe` still serve an **explicitly-named** GI (no hard dead period for explicit use). Registry present → **fail-closed**: only listed GIs allowed; an empty list denies all; feed/canary GIs (`MCPGIs`/`MCPGIFields`/`MCPAccess`, in `EXCLUDED_GI_NAMES`) are always denied even while inactive. A failed rebuild serves the cached last-good (gate stays enforced) rather than flapping. Enforced in `run_inquiry` + `describe_inquiry`; `list` shows only gated GIs (+ curated descriptions). **Independent of the gate, `run_inquiry` and `describe_inquiry` refuse parameterized GIs** (`parameterizedGiNames` `$metadata` check) — querying/sampling one over OData returns silently wrong data; fails open if `$metadata` is unavailable.
+- **Space-padded trim.** Acumatica returns fixed-width keys padded (`"MAIN01    "`), which break equality filters; `cleanGiRow`/`cleanGiRows` (`src/lib/gi-rows.ts`) trim string values + strip `@odata.*` everywhere a GI row reaches the model.
+- **Cache.** `cache:gi_registry` (durable last-good TTL + ~1 h `builtAt` freshness) + per-isolate memo. Cleared by `acumatica_clear_cache` (everything, or `target=gi`) — which since 0.48.1 also calls `resetGiRegistryMemo()`. That matters: `getGiRegistry()` checks the memo **before** it reads KV, so deleting the KV entry alone was a no-op for the life of the isolate and the tool reported `cleared` while serving the stale registry. Since 0.49.2, `target=gi` also sweeps the per-GI inferred sample caches (`cache:gi_schema:{InquiryName}`, written by `describe_inquiry`) — without the sweep, a GI design change (e.g. columns deactivated) left `describe_inquiry` returning a fresh curated field list alongside a stale `sampleRow` still carrying removed columns (observed live 2026-08-18). Target matching lives in the import-free leaf `src/tools/clear-cache-match.ts` (unit-tested). Registry changes otherwise apply on the next isolate (same model as runtime config).
+- **Writing column descriptions back (`GIResult.UsrResAIDescription`).** No write path exists on the stock `Default` endpoint — `GIDesign`/`GIResult` are system DACs. Via a custom endpoint exposing `GenericInquiry` with `ResultGrid` mapped as a **detail collection**, PUT to the *collection* URL (`/entity/{endpoint}/{ver}/GenericInquiry`, not `/{id}`, which 500s "Invalid uri structure") with the record `id` in the body and **each detail row addressed by its own `id`**. Sending `LineNbr` instead makes Acumatica attempt an INSERT (422, "Data Field cannot be empty"). One PUT carries every column of a GI. HTTP 200 never proves persistence — read back and compare.
+- **The display name the documented naming rule depends on is NOT obtainable — verified 2026-08-31, so don't retry this.** Acumatica documents that OData property names are generated from the field's **display name** (English locale; unchanged if valid, `_` prefix if it starts with a digit, invalid symbols such as spaces stripped) — *Preparation of an Inquiry for Exposure* → "Supporting the OData Specification", present in both the 25R2 and 26R1 doc sets. That invites an obvious fix: read the display name from the design and resolve names directly instead of aligning positionally. It does not work. `GIResult.fieldName` is a **virtual (unbound) field** — Acumatica's own error is `Filter on '{0}' is not allowed because it is a virtual field` — so it is never projected into the GI's SQL and comes back NULL over OData (measured: null in 1 000 of 1 000 active exposed result columns across 60 GIs; `Caption` 35.2 % populated, `SchemaField` 7.9 %). A virtual field is uniformly null, so **no per-GI investigation can change this** and the GIs that currently refuse alignment cannot be rescued this way. Positional inference stays necessary. Also documented and worth knowing: keys always appear in the EntityType as `PropertyRef` "even if these key fields have not been added to the **Results Grid** tab" (*GI Access Through OData: General Information*) — the documentary basis for hoisting, though the docs never state *where* they land. Column **order**, the `_N` collision-suffix rule, and the fact that `Caption` affects the property name at all remain undocumented.
+- **The design→property mapping has exactly one ambiguous step: key hoisting.** Once the hoist count is known (leading `$metadata` properties that are entity keys), every remaining column follows `SortOrder`. So the only freedom is *which* rows are hoisted, and where those rows carry no caption nothing determines it — an aligner picks one arbitrarily and reports success. Verified failure on `AP-Bills and Adjustments`: one wrong hoist shifted every uncaptioned column by one (`Amount` attributed to the vendor's invoice-number row) while the captioned columns near the end still matched, so the alignment looked valid. Name-similarity heuristics do not resolve it in either direction (`EmployeeId ← acctCD` scores zero and is correct; `refNbr → ReferenceNbr` scores zero and is also correct). **Always query a few rows and confirm each property returns the kind of value its design row implies before writing.** `skills/acumatica-gi-descriptions/scripts/align_columns.mjs` now flags GIs whose hoists lack evidence, as a check list rather than a verdict.
+- **Operator prerequisite to activate:** grant the `MCP Access` role **read access to the `MCPGIs` + `MCPGIFields` GIs**, then tag in-use GIs `ExposedtoMCP`. `ExposedtoMCP` is authoritative; the `*MCP` GI-naming convention is just convention. Until then the gate stays inactive.
+- **Deferred:** usage-driven promotion of frequently-used GIs to dedicated per-GI tools (recompute `gi_promoted` during the lazy build from R2 `do-logs`; register in `init()` with hysteresis). Held back because it mutates the live tool list and touches the Claude.ai tool-list caching fragility — to be added after the gate bakes in production.
+
+## Configuration
+
+### Tracked deploy template:
+- `wrangler.jsonc` — committed at repo root with placeholder values (`""` KV ids, `https://your-instance.acumatica.com`, etc.). Both install paths consume it: the "Deploy to Cloudflare" button reads it from a fork to auto-create bindings; `setup.sh` substitutes real values into it in place. Local production values (real KV id, hallboys-specific routes) are kept in the working tree but suppressed from `git status` via `git update-index --skip-worktree wrangler.jsonc`. The file `wrangler.jsonc.local-backup` is written by setup.sh before overwriting and is gitignored.
+
+### Gitignored (instance-specific):
+- `.dev.vars` — secrets for local dev
+- `swagger.json` — instance OpenAPI spec
+- `wrangler.jsonc.local-backup` — last pre-overwrite copy of `wrangler.jsonc`, written by setup.sh
+
+### Other tracked templates:
+- `.dev.vars.example` — documents required secrets
+
+### Environment Variables (in wrangler.jsonc `vars`):
+- `ACUMATICA_URL` — e.g., `https://your-instance.acumatica.com`
+- `ACUMATICA_TENANT` — Acumatica tenant/login company name (e.g., `Production`). Used for OData GI endpoint URL.
+- `ACUMATICA_ENDPOINT_VERSION` — `25.200.001`
+- `ACUMATICA_ENDPOINT_NAME` — contract-API endpoint name (the `{name}` in `/entity/{name}/{version}`). Optional; defaults to `Default` (Acumatica's stock system endpoint). Override only when targeting a custom Web Service Endpoint (SM207060). A custom endpoint can rename/reshape entities, so the hardcoded names in `GETTER_TOOLS` are only guaranteed against `Default`. The getters are **endpoint-aware**: on a non-`Default` endpoint a 404 is re-messaged (via `endpointAware404Message()` in `src/tools/getter-errors.ts`) to tell the model the entity may simply not be exposed by that endpoint — distinct from a wrong key — and to confirm with `acumatica_describe_entity`/`acumatica_search_schema`. On `Default` the plain "verify the ID" message is kept.
+- `ACUMATICA_MAX_RECORDS` — max rows per query (default `1000`). Runtime-overridable via `config:acumatica_max_records` in KV (set from the admin console).
+- `ACUMATICA_MAX_CONCURRENT` — max simultaneous Acumatica calls per user (default `3`). Runtime-overridable via `config:rate_limit_max_concurrent`.
+- `ACUMATICA_MAX_PER_MINUTE` — max Acumatica calls per user per calendar minute (default `40`). Runtime-overridable via `config:rate_limit_max_per_minute`.
+- `ACUMATICA_RATE_LIMIT_QUEUE_WAIT_MS` — how long a request waits for a busy concurrency slot before being rejected (default `2000`; `0` = reject immediately). Runtime-overridable via `config:rate_limit_queue_wait_ms`.
+- `ACUMATICA_CANARY_GI` — name of the canary Generic Inquiry the login access gate reads over OData (default `"MCPAccess"`). The server checks GI-readability, not role membership; restrict who can read it in Acumatica however you like (a marker role is the recommended way).
+- `REDACT_PATTERNS` — comma-separated additional field name patterns to redact (e.g., `CustomSSN,EmployeeNotes`)
+- `REDACT_SKIP` — comma-separated field name patterns to whitelist from redaction (e.g., `BirthDate`)
+
+### Secrets (via `wrangler secret put` or `.dev.vars`):
+- `ACUMATICA_CLIENT_ID` — from Acumatica Connected Application (SM303010)
+- `ACUMATICA_CLIENT_SECRET` — from Acumatica Connected Application
+- `COOKIE_ENCRYPTION_KEY` — random 256-bit hex (`openssl rand -hex 32`)
+- `ADMIN_SECRET` — password for the admin console at `/docs/admin`
+
+### KV Namespaces:
+- `TOKEN_STORE` — per-user Acumatica tokens, temporary OAuth state, metadata cache, and runtime config overrides (`config:*` prefix)
+- `OAUTH_KV` — required by `@cloudflare/workers-oauth-provider` internally (points to the same physical namespace as `TOKEN_STORE`)
+
+### R2 Buckets:
+- `mcp4acumatica_logs` — long-term log storage via Logpush (requires Workers Paid plan for Logpush; R2 free tier: 10 GB)
+- `mcp4acumatica-index` (binding `INDEX_STORE`) — schema-knowledge + documentation indexes (`schema-index.json`, `docs-index.json` + `docs-chunks/*` parts, future `dac-index.json`/`gi-examples-index.json`). Built offline by `scripts/` and uploaded with `npm run upload-index` (or auto by `setup.sh` post-deploy). Optional — the index-backed tools degrade gracefully when the bucket is unbound or empty.
+
+### Runtime Config (KV-backed):
+Settings can be changed at runtime via the admin console at `/docs/admin/settings` without redeploying. KV overrides take precedence over env vars. Changes take effect when the next DO instance starts (DOs recycle within minutes on idle). Config keys stored in KV with `config:` prefix:
+- `config:redact_patterns`, `config:redact_skip`
+- `config:acumatica_max_records`
+- `config:rate_limit_max_concurrent`, `config:rate_limit_max_per_minute`, `config:rate_limit_queue_wait_ms`
+- `config:writes_enabled`
+
+Each entry in `CONFIG_KEYS` (`src/lib/config.ts`) may carry a `defaultValue`, which the settings page renders as the input's placeholder — so a setting with no KV override and no env var still shows the built-in value in effect rather than an empty box.
+
+### Acumatica Connected Application (SM303010):
+- **Redirect URI:** `https://mcp4acumatica.hallboys.com/callback` (plus `https://acumatica-mcp.hallboys.com/callback` while the legacy alias is still live, and the *.workers.dev URL if you use that too — every hostname users connect to must be listed)
+- **Scope:** Not configured on the Connected Application — SM303010 has no scope field. The server requests `api openid profile email offline_access` in the `/authorize` URL (`offline_access` is REQUIRED — without it Acumatica issues no refresh token and sessions die when the ~1h access token expires).
+
+### Acumatica Access-Gate Prerequisites:
+- **Canary GI:** Create `MCPAccess` GI (SM208000; name configurable via `ACUMATICA_CANARY_GI`). Can be trivial (any single column). Enable **Expose via OData**. The login access gate checks whether the user can *read* it — it does **not** check role membership.
+- **Restrict read access (recommended: a marker role):** Create `MCP Access` role (SM201005, no permissions), assign the `MCPAccess` GI only to that role, and assign the role to users who should have AI assistant access. Any mechanism that controls OData read access to the GI works.
+
+### GI Gate Registry (activates the GI opt-in gate — strongly recommended for data correctness, 0.37.0):
+- **Feed GIs:** `MCPGIs` (one row per exposed GI) and `MCPGIFields` (one row per exposed GI's output column), both **Exposed via OData**, both parameter-free, and **neither tagged `ExposedtoMCP`**. Provided in `acumatica/` (`MCPGIs.xml`/`MCPGIFields.xml`) — import on SM208000 rather than hand-building. See "GI Tool Gating & Registry".
+  - **Re-import `MCPGIFields.xml` if the instance predates 0.48.0** — it gained the `SortOrder` and `IsActive` output columns (positional alignment can't attach column descriptions without them) plus a `UsrExposedToMCP`/`ExposeViaOData` row filter. Older feeds still build a registry; their GIs just keep field names/types with no curated column text.
+- **Feed access:** grant the `MCP Access` role **read access to `MCPGIs` + `MCPGIFields`** so any connected user's token can build the registry (lazy pull — no service account).
+- **Tagging:** the exposure flag + descriptions are custom fields on the `GIDesign`/`GIResult` system DACs (`GIDesign.UsrExposedToMCP` bool, `GIDesign.UsrAIDescription` string(2000), `GIResult.UsrResAIDescription` string(1000)), so they require a one-time **customization project** — **bundled in `acumatica/`** (`MCP4Acumatica-AIDescription.zip`; built on 25.201, adds the fields + SM208000 form). The feed GIs + canary are bundled there too (`MCPGIs.xml`/`MCPGIFields.xml`/`MCPAccess.xml`). Import the zip via SM204505 + the GIs via SM208000, grant the `MCP Access` role read on the feeds, then tag the GIs you want exposed. Until ≥1 GI is tagged and the feeds are readable, the gate stays **inactive** — `list` returns no GIs (no discovery); a GI can still be run by exact name. See `acumatica/README.md` for the column→code mapping.
+
+## Tech Stack
+
+- **Runtime:** Cloudflare Workers + Durable Objects
+- **MCP:** `agents` SDK 0.21.0 (McpAgent), `@modelcontextprotocol/sdk` 1.30.0
+- **Auth:** `@cloudflare/workers-oauth-provider`
+- **HTTP routing:** Hono
+- **Language:** TypeScript
+- **Validation:** Zod 4 (tool parameter schemas)
+- **Markdown rendering:** marked (docs site)
+
+## Common Commands
+
+```bash
+npx wrangler dev              # Local dev
+npx wrangler deploy           # Deploy to Cloudflare
+npx tsc --noEmit              # Type check
+npm test                      # Run unit tests (node --test, TS type-stripping)
+npx wrangler tail             # Live logs
+npx wrangler secret put X     # Set a secret
+npx wrangler kv namespace create X  # Create KV namespace
+```
+
+## Acumatica Version Upgrades
+
+When the connected instance moves to a new Acumatica release (e.g. 2025 R2 → 2026 R1) or is
+repointed at a different instance/tenant, follow **`docs/upgrading-acumatica.md`** (served at
+`/docs/upgrading-acumatica`). Summary of what's version-coupled in this server:
+
+1. **`ACUMATICA_ENDPOINT_VERSION`** (contract base `/entity/Default/{version}`) — update the var, redeploy; preflight (`/docs/admin/preflight`) flags a wrong value.
+2. **Schema-knowledge index** — re-export the instance's `swagger.json` and `npm run build-index` (0.34.0+); otherwise `acumatica_search_schema`/`_get_schema_entity`/`_list_schema_entities` describe the old shape. No redeploy needed; the next DO instance reads the new R2 object.
+3. **Runtime metadata cache** — `acumatica_clear_cache` (entity `$adHocSchema`, GI list, GI field schemas are cached 24 h / 1 h).
+4. **Access-control prerequisites** — `MCP Access` role + `MCPAccess` canary GI (OData-exposed) + Connected App (Authorization Code flow + redirect URIs; scopes are request-side, not configured on the app) survive upgrades but should be re-verified.
+5. **Hardcoded entities** — `GETTER_TOOLS` (`src/tools/getter-registry.ts`) entity names are stable across releases but spot-check key entities and update entries if upstream renames/removes one.
+6. **Two independent version numbers** — the **MCP server version** (`0.34.0`, bumps each release) vs. the **targeted Acumatica release** (the `25R2`/`26R1` *tag prefix*, changed only when re-targeting).
+
+> **Maintenance instruction (standing):** whenever a feature is added that depends on the
+> Acumatica version — a new index built from instance data (DAC, GI examples), a hardcoded
+> endpoint/entity, a new cached artifact, or a published meta-GI — add its concrete upgrade
+> step to `docs/upgrading-acumatica.md` (it has a "Forward-looking" section staging the
+> planned ones). Treat this as part of finishing such a feature, not a follow-up.
+
+## Commit / Push / Tag Checklist
+
+Before every commit, push, or tag:
+
+1. **Update documentation** — ensure all docs (`README.md`, `docs/*.md`) reflect any changes made in the commit.
+2. **Update `CHANGELOG.md`** — add an entry for the new version (Keep a Changelog format, newest first; surfaced on the docs site at `/docs/changelog`).
+3. **Update version strings in documentation** — if the tag is changing, update the version in:
+   - `CLAUDE.md` → `Current tag` field in Project Overview
+   - `docs/tool-reference.md` → version in the opening paragraph
+   - `src/docs/docs-handler.ts` → `<span>v... &middot; 51 tools</span>` in the nav brand
+   - `src/index.ts` → McpServer version string
+   - `package.json` → `version` field
+4. **Update the upgrade guide if relevant** — if the change adds/alters anything version-coupled (a new instance-derived index, a hardcoded endpoint/entity, a cached artifact, the targeted-release prefix), update `docs/upgrading-acumatica.md` accordingly.
+
+## Close Session Procedure
+
+When the user says **"close session"**, perform all of the following:
+
+1. **Update CLAUDE.md** — ensure it reflects all changes made during the session
+2. **Increment version** — bump the patch version (e.g., 0.22.0 → 0.22.1) unless a minor/major bump is warranted
+3. **Update version strings** in:
+   - `CLAUDE.md` → `Current tag` field in Project Overview
+   - `docs/tool-reference.md` → version in the opening paragraph
+   - `src/docs/docs-handler.ts` → `<span>v... &middot; 51 tools</span>` in the nav brand
+   - `src/index.ts` → McpServer version string
+   - `package.json` → `version` field
+4. **Update `CHANGELOG.md`** — prepend an entry for the new version (newest first; shown at `/docs/changelog`)
+5. **Commit** all changes with a descriptive message
+6. **Push** to `origin/main`
+7. **Tag** with `25R2-X.Y.Z` format
+8. **Verify CI created the GitHub Release** — pushing the tag triggers
+   `.github/workflows/release-on-tag.yml` (caller of the org-wide reusable
+   workflow in `hallboys/.github`), which creates the Release with that
+   version's CHANGELOG section as notes. Check with `gh release view 25R2-X.Y.Z`;
+   only create manually if CI failed.
+9. **Deploy** with `npx wrangler deploy` and verify the deployment succeeds
+
+## Known Issues / Tech Debt
+
+- **The base `Agent` owns the DO's alarm slot (agents 0.21.0+).** Do **not** call
+  `ctx.storage.setAlarm()` or override `alarm()` in a class extending `McpAgent`. The base
+  `Agent`'s scheduler treats the single DO alarm as its own: it re-arms it from its schedule
+  table and calls `deleteAlarm()` whenever it finds no rows due, so a hand-rolled alarm is
+  silently cancelled (no error, the callback simply never fires) and an `alarm()` override
+  shadows the base dispatcher, breaking the SDK's own scheduling. Use
+  `this.schedule(seconds, "methodName")` and a public callback method instead — this is what
+  the audit-log flush does (`flushLogsScheduled`). Cost us a silent-drop hazard when
+  upgrading from 0.0.98, where the raw-alarm pattern was correct.
+- **User identity retrieval:** The OIDC `/identity/connect/userinfo` endpoint (with `openid profile email` scopes) is the primary method. Falls back to `/entity/auth/25.200.001/UserSecurityInfo` which may not exist on all instances. If both fail, username defaults to a UUID-based key (breaks token reuse across sessions).
+- **Acumatica system entities not available via contract API:** `User`, `UserRole`, and screen-based API (`/entity/Default/.../screen/SM201010`) all return 404 on SaaS instances. The canary GI approach for the access gate was adopted because of this limitation (there's no API to query role membership).
+- **`$select` on some entities causes Acumatica 500:** Some entities (e.g., Payment) return internal server errors when `$select` is used with certain field names. The `acumatica_list_entities` tool auto-retries without `$select` when this occurs.
+- **Empty / non-JSON 2xx bodies (fixed 0.44.0):** `await response.json()` on an empty Acumatica body throws the raw V8 message `Unexpected end of JSON input`, which reached the model verbatim as the entire explanation. Production log analysis (4734 R2 objects, 13 292 tool invocations, 2026-04-09 → 07-31) counted **279 occurrences** — ~14 % of *current* tool errors — almost all from `acumatica_run_inquiry` (259) plus `acumatica_describe_inquiry` (20). `parseAcumaticaJson()` (`src/lib/response-parse.ts`, import-free leaf, unit-tested) now handles all three 2xx-body call sites in `acumatica-client.ts`. An empty body is **not** converted to "no rows" — standard OData returns `{"value":[]}` for an empty result set, so a body-less 200 is anomalous, and silently reporting zero rows is the same silent-wrong-data failure the `possibleFalseNegative` warnings exist to prevent; the message says so explicitly. The **write** path (`put()`) passes `kind: "write"` and gets the opposite advice — **do not retry**, because a success normally echoes the saved record and retrying an unconfirmed write can duplicate an auto-numbered record (PUT-as-upsert is only idempotent when the key is supplied); the user is told to verify in Acumatica. Non-JSON bodies report the cause plus a whitespace-collapsed 200-char snippet (usually an HTML sign-in page) instead of a parser message. **Cause identified 2026-08-16 and pre-flighted in 0.49.0:** a `$filter` that references a **calculated** GI column — one whose design field is a `=…` expression — produces exactly this empty-body 200. Reproduced three times live: a filter on a stored column works, while adding `and <ExpressionColumn> ne 0` fails with the empty body. That explains why the occurrences concentrate in `acumatica_run_inquiry` (259 of 279) — GIs are where calculated columns live. Fixed for curated GIs in 0.49.0: `resolveFields` flags expression columns (`GiFieldMeta.expression`, set only where a design row was *aligned* to the property — a refused alignment carries no flags, since a mis-placed flag would refuse filters on a filterable column); `handleRunInquiry` pre-flights the filter via `filterReferencedColumns()` (`src/lib/odata-v4-errors.ts` — literal-safe, case-sensitive identifier match) and refuses with `buildCalculatedColumnRefusal()` **before contacting Acumatica**, naming the offending columns and listing the stored `filterableFields`; `describe_inquiry` surfaces `calculated: true` per field plus a warning note. Uncurated GIs (gate inactive / refused alignment) still hit the raw empty body — `parseAcumaticaJson()` remains the backstop there.
+- **The GI OData endpoint is OData v4; the contract API is v3 (fixed 0.46.0).** `acumatica_run_inquiry` queries `/t/{tenant}/api/odata/gi`, which is **v4** (its parser errors are verbatim Microsoft.OData.Core wording); `acumatica_list_entities` queries the contract API, which is **v3**. Until 0.46.0 **both tools carried byte-identical v3 filter guidance**, so every partial-match GI query was instructed to use `substringof()` — which does not exist in v4 — and forbidden from using `contains()`, which is the correct v4 function. Verified live on 25R2 (2026-07-31): `substringof('BAD', Description)` → *"unknown function with name 'substringof'"*; `contains(Description,'BAD')` → works; `startswith`/`endswith` → work in **both**; `tolower()`/`toupper()` → **work on v4** though they 500 on contract REST; `CreatedOn gt datetimeoffset'2024-01-01'` → *"Unrecognized 'Edm.String' literal"* while bare `2024-01-01T00:00:00Z` works. This was the largest current error source: July 2026 logs showed **97 of 242 tool errors** (~41%) were dialect/naming mistakes — 44 unknown-function, 43 unknown-property, 10 type-mismatch. Fixes: (a) `run_inquiry`'s `filterExpression` description now documents v4 and warns explicitly not to carry syntax from `list_entities`; `docs/odata-filtering.md` leads with a dialect-comparison table and has a "Generic Inquiries use OData v4" section. (b) `src/lib/odata-v4-errors.ts` (import-free leaf, unit-tested) classifies the four v4 parser errors and `handleRunInquiry` returns a **correction** envelope instead of the bare message — `{ error: "invalid_filter", problem, useInstead, supportedFunctions | availableFields, actionRequired }`. For a bad property name it supplies the **real** names from `gate.entry.fields` (already resolved from `$metadata` by the GI registry, so no extra round-trip). Every correction states the query **never executed**, so a rejected filter can't be reported to the user as "no records matched". Note `normalizeODataFilter()` is a v3-motivated workaround still applied on this path; it is harmless under v4 (a bare boolean function is equally valid) and was left in place rather than silently changing behavior for filters already in use.
+- **`substringof(...) eq true` silently returns `[]`:** Acumatica's contract-REST `$filter` parser returns an empty set (HTTP 200, no error) for a boolean string function compared to a literal — `substringof('X', F) eq true` / `startswith(...) eq true` / `endswith(...) eq true` — but the *bare* function works. Models habitually append `eq true` (valid OData v3). `normalizeODataFilter()` (`src/lib/odata-filter.ts`) strips it server-side for both `acumatica_list_entities` and `acumatica_run_inquiry`. `eq false` is left verbatim — the only equivalent negation (`not substringof(...)`) 500s on the contract API. NOT a transport/encoding bug (an early parens-encoding hypothesis was disproven live).
+- **Complex document entities can't be server-side `$filtered` on non-key fields:** PurchaseOrder, Shipment, PhysicalInventoryCount (and any filter that reaches a child collection, e.g. `StockItem/CrossReferences/AlternateID`) fail in two ways — (A) HTTP 500 from the OData filter binder (`CannotOptimizeException`, "type conversions not supported", "not a single value", "key not present") or (B) a *silent* `[]` even when matching rows exist (e.g. `substringof` on PurchaseOrder `VendorID`). A keyed filter (`OrderNbr`/`ShipmentNbr eq '...'`, topN=1) is optimizable and works; broad search must use a Generic Inquiry. `getFilterErrorKind()` (`src/lib/complex-entities.ts`) classifies mode-A 500s into a structured `filterNotApplicable` error; mode-B empties on the known-list entities get a `possibleFalseNegative` warning so the model doesn't conclude "no such record exists." The known-list is hardcoded — see `docs/upgrading-acumatica.md` §7.
+- Old Entra ID secrets may still exist on Cloudflare — clean up with `wrangler secret delete ENTRA_CLIENT_ID`, etc.
+- **A GI whose name contains a URL path separator is registered but unusable, and nothing warns.** Found 2026-09-02: a GI named with `/` resolves in `$metadata` (the server matches via `normalizeName`, which strips punctuation) so the registry builds a full entry — but `run_inquiry` 404s and `list_generic_inquiries` never returns it, because `/` cannot be addressed in the OData path. It had always been undiscoverable and unqueryable despite being tagged `ExposedToMCP`. `skills/acumatica-gi-descriptions/scripts/align_columns.mjs` **does** check this (`not_in_metadata — name contains '/'`); the server does not. Operator fix is a rename, but the server should refuse to register such a name. **Related drift:** that same script models a third **dropped-row** state (a row the platform silently discards, producing no property) that `resolveFields` lacks — the standing instruction is to keep the two matched, and they have diverged.
+- **Zod schema constraint:** MCP tool parameter schemas MUST use only simple types (`z.string()`, `z.string().optional()`, `z.string().default("value")`). Complex types like `z.record()`, `z.unknown()`, `z.number()` cause MCP SDK JSON Schema serialization failures and tools won't appear in client discovery. Use `z.string()` with manual `parseInt()` in the handler for numeric parameters.
+- **ChatGPT CIMD bug (as of April 2026):** ChatGPT's MCP client sees `client_id_metadata_document_supported: true` in our metadata but fails to complete CIMD (it doesn't have its own metadata document URL) and does not auto-fallback to DCR. Users must manually select DCR when adding the server in ChatGPT. Our server correctly advertises both — this is a ChatGPT client-side issue.
+- **Claude.ai tool list caching:** Claude.ai may cache the tool list from a previous Durable Object session. If tools appear stale, disconnect and reconnect the MCP server in Claude.ai to force a fresh `init()` call.
+- **Claude.ai re-auth is not silent, and can get stuck:** When the server revokes a grant (dead Acumatica token → `ReauthRequiredError`), the 401 + `WWW-Authenticate` *should* let the client re-run OAuth invisibly. In practice Claude.ai surfaces a **reconnect prompt** rather than re-authing silently, and after a few failed attempts it caches the connector in a dead state and stops prompting entirely. Recovery for an **org-managed** connector is a **personal disconnect → reconnect** (the org-level "delete" is not available/needed to individual users) — this clears the stuck personal grant and starts a fresh `/authorize` flow. The `0.33.0` TokenManager DO removes the *spurious* revokes (rotation races) that were triggering this; genuine dead-token revokes still prompt.
+- **`/authorize` error mapping on a bad/unfetchable `client_id` (fixed 0.38.5):** `app.get("/authorize")` wraps `parseAuthRequest()` in try/catch. A CIMD-fetch failure → **502** ("client's metadata endpoint down, not this server"); a malformed/invalid `client_id` → **400**; both log `authorize_parse_failed` (client_id + error, no secrets) for `wrangler tail`. Previously the throw surfaced as an opaque HTTP 500. This is **not** harmless: when Claude.ai's CIMD metadata endpoints (`claude.ai/oauth/mcp-oauth-client-metadata`, `…/claude-code-client-metadata`) had a transient 503 outage (observed 2026-07-06), the server-side CIMD fetch failed and *every* CIMD client (Claude.ai web + current Claude Desktop) hit the 500 and couldn't connect — DCR clients were unaffected. The 502 now makes that failure mode self-diagnosable from the server's own response/logs.
+- **No description metadata for Generic Inquiries.** *(Addressed in 0.37.0 via the GI registry — see "GI Tool Gating & Registry". The curation now lives in the `MCPGIs`/`MCPGIFields` feed GIs (`UsrAIDescription` fields), surfaced through the lazy registry; this is a hybrid of cures #2 and #3 below. The note is kept for the underlying-platform context.)* The Acumatica GI Design form (SM208000) has no free-text "Description" field on the header — only `Inquiry Title` (a short label, often just a prettified name) and `Site Map Title` (set only for nav-pinned GIs). The OData GI service document returns `{name, url}` only; nothing richer is exposed. As a result, `acumatica_list_generic_inquiries` surfaces GIs by name alone, leaving the model to guess which GI matches a user's intent. Parametrized GIs are already excluded at list time (see `generic-inquiry-discovery.ts` — `$metadata` is scanned for `FunctionImport Name="..._WithParameters"` entries and those are filtered out), so the gap is narrowly about selection context for the surviving non-parametrized GIs. Potential cures:
+  1. **MCP-side curation map.** KV-backed `gi_descriptions:{name} → text` edited from the admin console. Filter the list to GIs that have a description, inject the description into the response. Curation lives where it's consumed, zero Acumatica-side change. Downside: descriptions invisible inside Acumatica; admins must maintain a second list.
+  2. **Acumatica-side meta-GI.** Admin publishes a `MCPGIIndex` GI whose rows are `(Name, Description)` pulled from a custom table or hand-maintained dataset. Visible inside Acumatica, but heavier setup and the descriptions live separately from the GI definitions themselves.
+  3. **Extract GI definition (XML / GIQL) via API and auto-generate descriptions.** If Acumatica exposes the GI design body — tables joined, filters, output columns — through a screen-based API, OData $metadata annotations, or an export endpoint, feed each GI's structure to Claude Code (or any model) and have it produce a one-line description plus parameter/usage notes from the query itself. Cache the generated text alongside the existing GI metadata cache. Most automated of the three; requires verifying which API surface (if any) returns the design body on SaaS — historically system entities like `GenericInquiry` / `GIDesign` are not in the contract API (see the "system entities" note above), so this path likely depends on either a non-public endpoint or an admin-published export.
+
+## TODO — Remaining Project Work
+
+### Completed — Read-Only Tools (38 total, 0.1.0–0.10.0)
+- [x] Core: Customer, Vendor, SalesOrder (0.1.0)
+- [x] Financial/Accounting: Invoice, Bill, JournalTransaction, Payment, Account, Check (0.2.0)
+- [x] Inventory & Warehouse: StockItem, NonStockItem, InventoryQuantityAvailable, InventorySummaryInquiry, Warehouse, ItemClass (0.3.0)
+- [x] Purchasing: PurchaseOrder, PurchaseReceipt (0.4.0)
+- [x] Projects: Project, ProjectTask, ProjectBudget, ProjectTransaction (0.5.0)
+- [x] Service & Field: Case, ServiceOrder, Appointment (0.6.0)
+- [x] Sales & CRM: Contact, BusinessAccount, Opportunity, Lead, Salesperson (0.7.0)
+- [x] Shipping & Fulfillment: Shipment, SalesInvoice (0.8.0)
+- [x] HR & Payroll: Employee, ExpenseClaim, TimeEntry (0.9.0)
+- [x] CRM Activities: Email, Event, Activity, Task (0.10.0)
+
+### Completed — Utility/Discovery Tools (6 total, 0.11.0–0.20.0)
+- [x] Generic Inquiry: acumatica_run_inquiry (0.11.0)
+- [x] Entity List/Search: acumatica_list_entities (0.12.0)
+- [x] Entity Schema Discovery: acumatica_describe_entity (0.13.0)
+- [x] GI Discovery: acumatica_list_generic_inquiries, acumatica_describe_inquiry (0.16.0; switched to OData GI endpoint with OAuth 2.0 Bearer tokens)
+- [x] Metadata Cache: KV-backed caching for entity schemas (24h), GI lists (1h), GI field schemas (1h); acumatica_clear_cache tool for on-demand invalidation (0.20.0)
+
+### Completed — Documentation & Infrastructure
+- [x] Documentation site served from `/docs` on the same worker (0.14.0)
+- [x] docs/tool-reference.md, example-prompts.md, odata-filtering.md, architecture.md, self-hosting-guide.md
+- [x] CIMD support enabled alongside DCR, OpenID Connect discovery endpoint added (0.15.0)
+
+### Completed — Access Control & Governance (0.19.0)
+- [x] Access gate via canary GI (readability of `MCPAccess` GI checked over OData; role membership never queried)
+- [x] Consent interstitial page between access check and MCP session activation
+- [x] Sensitive field redaction (pattern-based, configurable via REDACT_PATTERNS/REDACT_SKIP)
+- [x] Enhanced audit logging (username in all entries, auth events, redaction events)
+- [x] OIDC userinfo for identity (openid profile email scopes)
+- [x] Auto-retry without $select on entity list 500 errors
+- [x] Anti-pagination tool descriptions and structured truncation envelope (`truncated`, `paginationSupported: false`, `actionRequired`) — instructs the model to ask the user for a narrower filter rather than retry
+- [x] `ACUMATICA_MAX_RECORDS` is runtime-overridable from the admin console (`config:acumatica_max_records` in KV)
+- [x] Storage abstraction layer — `IKeyValueStore` interface + `AppEnv` type for platform portability (0.23.0)
+- [x] Self-hosting documentation — `docs/self-hosting-guide.md` with Node.js adapter guide
+
+### Completed — Installation & Diagnostics (0.30.0)
+- [x] One-shot deploy script (`setup.sh`) + one-line installer (`install.sh`) with end-to-end preflight check
+- [x] "Deploy to Cloudflare" button — fully GUI install path; `wrangler.jsonc` now tracked as the deploy template
+- [x] Preflight diagnostic page at `/docs/admin/preflight` and `/callback` OAuth-error mapping via `interpretTokenError()`
+- [x] Tool description rework — instance-specific ID format wording, lookup pointers, expand/denylist/cache disclosures
+- [x] `runGetter` empty-string guard for required path-segment params
+
+### High Priority — Features
+- [~] Add write tools: Create/update Sales Orders, Customers, Vendors (per project brief Phase 2) — write-tool infrastructure (`WRITER_TOOLS` registry + `runWriter`, kill-switch, dry-run gate, top-level & nested allowlist, R2-persisted mutation audit) + first tool `acumatica_create_or_update_customer` landed 0.40.0; Vendor / SalesOrder are one registry entry each
+- [ ] Add action tools: Release Invoice, Confirm Shipment (per project brief Phase 3)
+- [x] Transparent re-auth when refresh token expires — `ReauthRequiredError` revokes the MCP grant so the client silently re-runs OAuth instead of a manual disconnect/reconnect (0.32.0)
+
+### Low Priority — Read-Only Tools
+
+**Financial (additional):**
+- [ ] AccountSummaryInquiry — GL account balances by period/ledger
+- [ ] AccountDetailsForPeriodInquiry — GL transaction detail for a period
+- [ ] CashSale — point-of-sale cash transactions
+- [ ] CashTransaction — bank deposits, withdrawals, transfers
+- [ ] Budget — GL budget lines by period
+- [ ] Ledger — ledger master data (actual, budget, statistical)
+- [ ] Subaccount — sub-account segments
+- [ ] Tax — tax ID master data
+- [ ] TaxCategory — tax category definitions
+- [ ] TaxZone — tax zone definitions
+
+**Sales (additional):**
+- [ ] CustomerLocation — customer ship-to/bill-to locations
+- [ ] CustomerClass — customer classification defaults
+- [ ] CustomerPaymentMethod — stored payment methods
+- [ ] SalesPricesInquiry — item price lookup
+- [ ] Discount / DiscountCode — discount rules
+
+**Purchasing (additional):**
+- [ ] VendorClass — vendor classification defaults
+- [ ] VendorPricesInquiry — vendor price lookup
+
+**Inventory (additional):**
+- [ ] InventoryAllocationInquiry — allocation breakdown (on hand, available, on PO, etc.)
+- [ ] StorageDetailsInquiry / StorageDetailsByLocationInquiry — lot/serial detail
+- [ ] ItemWarehouse — per-warehouse item settings
+- [ ] KitSpecification — kit/BOM definitions
+- [ ] TransferOrder — inter-warehouse transfers
+- [ ] InventoryAdjustment / InventoryIssue / InventoryReceipt — inventory transactions
+
+**Other:**
+- [ ] FinancialPeriod / FinancialYear — fiscal calendar
+- [ ] Currency — currency master data
+- [ ] ShipVia / ShippingTerm / ShippingZones — shipping config
+
+### Low Priority — Infrastructure
+- [ ] Add Attachment upload/download tools
+- [ ] Remove old Entra ID secrets from Cloudflare (`wrangler secret delete`)
+- [~] Add unit tests — `test/` harness added (`npm test`, node --test); covers filter normalization + complex-entity detection. Broader coverage still pending.
+- [ ] Add CI/CD pipeline
+- [ ] **Docs-ingestion adapter for the DITA/topic-per-file corpus — do this when moving to 26R1.**
+  Acumatica now publishes the official docs as Markdown at `github.com/Acumatica/Acumatica-AI-Resources`
+  (branch per release; `2026R1` is the first, no `2025R2`), which becomes the preferred source at our
+  26R1 move. `scripts/build-docs-index.mjs` is calibrated for the PDF-converted, guide-per-file Beacon
+  corpus and degrades **silently** on the new shape: (1) DITA element IDs surface as Pandoc heading
+  attributes on every heading, and `chunkGuide()`'s `(.+)` swallows them into the breadcrumb — which is
+  what search matches; (2) a topic-per-file corpus makes a form an `#` rather than `##`, so
+  `currentH2()`'s "nearest heading at level ≤ 2" resolves a tab's form scope to the tab itself and Form
+  IDs never reach the tabs/field tables — `get_doc_section(formId)` returns only the intro. Escaped
+  parens are already handled (`FORM_ID_DEF_RE` + `test/docs-ingest.test.ts`). Neither issue is a defect
+  in Acumatica's conversion; both are correct DITA→Markdown output meeting our wrong-shaped assumptions.
+  Full detail + fixes in `docs/upgrading-acumatica.md` §3b.
+
+### Deferred — `createMcpHandler` migration (assessed 2026-08-18)
+
+`McpAgent` is marked **deprecated / feature-frozen** in agents 0.21.0, pointing at
+`createMcpHandler` from `agents/mcp/server`. Assessed and **deferred** — there is no
+forcing function (`McpAgent` has no announced removal), and the cost is concentrated
+in the DO-resident machinery, not the tools.
+
+**The name hides two migrations.** `createMcpHandler` is an alias for
+`createStatelessMcpHandler`: it takes an **MCP SDK v2** server factory
+(`@modelcontextprotocol/server`, already installed as a peer) and runs
+**stateless — no Durable Object anywhere in the path**. The factory
+(`(ctx: McpRequestContext) => McpServer`) is invoked **per request**. A third option
+exists: `createLegacyMcpHandler` keeps SDK v1 *and* sessionful behavior while dropping
+`McpAgent` (its `storage?: MCPStorageApi` adapter is optional) — the real intermediate
+step. The overloaded `createMcpHandler` in `agents/mcp` that accepts a v1 server is
+deprecated and slated for removal in the next major; do not migrate onto it.
+
+**Cheap:**
+- Tool registration is mechanical: `server.tool(name, desc, shape, cb)` →
+  `server.registerTool(name, { description, inputSchema: z.object(shape) }, cb)`. The
+  raw-shape form still works (deprecated, auto-wrapped). Registry-driven design means
+  the 38 getters + writers are a couple of lines inside the existing loops; only the 12
+  hand-written blocks need individual edits. **zod 4 is the prerequisite and is already paid** (0.50.0).
+- **OAuthProvider needs no change.** The stateless handler resolves auth from
+  `workerCtx.props` automatically (`handler-stateless`, `resolvedAuthContext`), which is
+  exactly what OAuthProvider injects. The 13 `this.props.acumaticaUsername` sites become
+  `getMcpAuthContext()` — an async-local-storage accessor, so tools read the user at call
+  time and one server instance can serve every user in an isolate.
+- Rate limiter unaffected (already per-user keyed, durable cap in KV). `TokenManager` DO untouched.
+
+**Expensive — the stateful machinery:**
+1. **The audit-log buffer is the bulk of the work.** The buffer + `ctx.storage` mirror +
+   scheduled flush + hydrate-on-eviction exist *because Logpush doesn't capture DO traces*.
+   Stateless removes the DO, so the subsystem loses both its home and its reason to exist —
+   Worker-level `console.log` **is** captured by Logpush. Encouragingly the admin console
+   already reads both the `do-logs/` and Logpush `YYYYMMDD/` prefixes, so the viewer likely
+   needs no change. But in-isolate buffering is **unsafe** (isolate eviction silently drops
+   audit entries), so the choice is Logpush-only or one R2 object per request via
+   `waitUntil` (~3x object growth; today ≈4 700 objects / 13 300 invocations).
+2. **Per-session `init()` becomes per-request** — 3 KV reads + an R2 `head` for the
+   conditional schema-tool registration. Needs a TTL'd per-isolate memo (the `loadIndex()`
+   pattern already in the codebase), and it changes the documented "config applies on the
+   next DO instance" semantics.
+3. Removing the `MCP_OBJECT` binding needs a `deleted_classes` migration and drops live
+   sessions at cutover; `docs/architecture.md`, `docs/self-hosting-guide.md` and this file
+   describe the DO design at length.
+
+**One-way doors:** stateless forecloses server-initiated messages (elicitation, progress,
+push — none used today), and needs validation that Claude.ai / Desktop / ChatGPT tolerate a
+server issuing no `mcp-session-id`.
+
+**The prize:** stateless **structurally eliminates** the concurrent-response-crossing bug
+class — there is no cross-request correlation map because there are no cross-request
+responses. That is a stronger guarantee than 0.21.0's fix, which is a correct implementation
+of a mechanism that can still be gotten wrong.
+
+**Recommended sequencing:** let 0.21.0 bake in production → settle the logging question on
+its own (it is the majority of the effort, separable from the handler choice, and moving to
+Logpush may be worth doing regardless) → then the handler swap becomes a modest change
+instead of a rewrite.
+
+## MCP Client Compatibility (as of April 2026)
+
+| Client | Registration | Status |
+|--------|-------------|--------|
+| Claude.ai (Team/Pro/Max/Enterprise) | CIMD | ✅ Works — observed `client_id=https://claude.ai/oauth/mcp-oauth-client-metadata` (CIMD, not DCR as previously documented) |
+| Claude Code (v2.1.81+) | CIMD preferred, DCR fallback | ✅ Works — publishes metadata at `https://claude.ai/oauth/claude-code-client-metadata` |
+| Claude Desktop | DCR | ✅ Works — uses `/register` |
+| ChatGPT | DCR (manual selection required) | ⚠️ Works with manual DCR — CIMD auto-detection broken on their side |
+| Microsoft 365 Copilot (custom federated connector) | Manual `/register` + Teams Developer Portal OAuth registration | ✅ Works since 0.53.0 (tool annotations) — contributor-verified in production ([PR #3](https://github.com/hallboys/MCP4Acumatica/pull/3)); setup in README → "Microsoft 365 Copilot" |
+
+### OAuth Discovery Endpoints
+
+The server responds on three well-known paths (all return identical metadata):
+- `/.well-known/oauth-protected-resource` (and `/mcp` suffixed variant) — RFC 9728
+- `/.well-known/oauth-authorization-server` — RFC 8414
+- `/.well-known/openid-configuration` — added for ChatGPT compatibility (proxies to oauth-authorization-server)
+
+## Acumatica API Patterns
+
+### Endpoint format:
+```
+GET {ACUMATICA_URL}/entity/{ACUMATICA_ENDPOINT_NAME}/{version}/{Entity}/{key}
+```
+`ACUMATICA_ENDPOINT_NAME` defaults to `Default`. The client builds this base URL once in `AcumaticaClient` (`src/lib/acumatica-client.ts`); `Default` is no longer hardcoded.
+
+### Common query parameters:
+- `$expand=SubEntity1,SubEntity2` — include nested records
+- `$filter=Field eq 'value'` — filter results
+- `$select=Field1,Field2` — limit returned fields
+- `$top=N` — limit result count
+
+### Field value wrapping:
+Every Acumatica field is `{value: X}`. Use `unwrapFields()` before returning to Claude.
+
+### Auth header:
+```
+Authorization: Bearer {per-user-access-token}
+```
