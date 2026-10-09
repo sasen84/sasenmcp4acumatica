@@ -25,7 +25,8 @@
 		"global_fetch_strictly_public"
 	],
 
-	// Acumatica instance configuration. Edit these for your deployment
+	}
+// Acumatica instance configuration. Edit these for your deployment
 	// (or leave the placeholders and override via the dashboard after deploy).
 {
   // ...
